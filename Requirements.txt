@@ -1,5 +1,0 @@
-yfinance
-pandas
-statsmodels
-plotly
-streamlit
