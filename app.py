@@ -1,147 +1,156 @@
+# ==========================================
+# ENHANCED: ACTIVE TRADE SUMMARY — INSTITUTIONAL GRADE
+# Renaissance / Medallion-inspired stat arb dashboard
+# ==========================================
+
 import streamlit as st
-import yfinance as yf
-import pandas as pd
 import numpy as np
-import statsmodels.api as sm
-from statsmodels.regression.rolling import RollingOLS
-from statsmodels.tsa.stattools import adfuller
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Omni-Arb Command Center", layout="wide", initial_sidebar_state="collapsed")
+# ── CONFIG ──────────────────────────────────────────────────
+ENTRY_Z   = 2.0
+EXIT_Z    = 0.5
+MAX_Z_VIZ = 3.5   # normalization ceiling for z-bar
 
-# ==========================================
-# CUSTOM CSS FOR SLEEK UI
-# ==========================================
-st.markdown("""
-    <style>
-    .main { background-color: #0e1117; color: #fafafa; }
-    .summary-card {
-        background-color: #1e2129; padding: 15px; border-radius: 8px;
-        border-left: 5px solid #00d1ff; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+# ── SIGNAL QUALITY SCORER ───────────────────────────────────
+def score_signal(sig: dict) -> int:
+    """
+    Composite 0–5 signal confidence score.
+    Mirrors Medallion-style multi-factor confirmation:
+      cointegration pass, ADF p-val, z-magnitude, R², half-life speed
+    """
+    score = 0
+    if sig["is_cointegrated"]:           score += 2   # primary gating criterion
+    if sig["adf_pval"] < 0.05:           score += 1   # statistical rigor
+    if abs(sig["curr_z"]) > 2.5:        score += 1   # extreme deviation = higher edge
+    if sig.get("r_squared", 0) > 0.80:  score += 1   # tight hedge proxy
+    return min(score, 5)
+
+# ── EXECUTION SIZING (dollar-neutral) ───────────────────────
+def compute_legs(sig: dict) -> dict:
+    shares_a = sig["shares"]
+    shares_b = int(round(shares_a * sig["beta"]))
+    notional_a = shares_a * sig["price_a"]
+    notional_b = shares_b * sig["price_b"]
+    dollar_imbalance = notional_a - notional_b   # target: ~0
+    return {
+        "shares_a":  shares_a,
+        "shares_b":  shares_b,
+        "notional_a": notional_a,
+        "notional_b": notional_b,
+        "imbalance":  dollar_imbalance,
     }
-    .signal-box-long {
-        background-color: rgba(40, 167, 69, 0.1); border: 2px solid #28a745;
-        padding: 20px; border-radius: 10px; margin-bottom: 15px;
-    }
-    .signal-box-short {
-        background-color: rgba(220, 53, 69, 0.1); border: 2px solid #dc3545;
-        padding: 20px; border-radius: 10px; margin-bottom: 15px;
-    }
-    h1, h2, h3, p { font-family: 'Inter', sans-serif; }
-    </style>
-    """, unsafe_allow_html=True)
 
-st.title("🚀 Omni-Arb Live Monitor v5.0 (Institutional)")
-st.caption(f"Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} EDT | Engine: Rolling OLS & ADF Cointegration")
-st.divider()
+# ── CARD RENDERER ────────────────────────────────────────────
+def render_trade_card(sig: dict) -> str:
+    is_long       = sig["direction"] == "LONG"
+    accent        = "#00d4a0" if is_long else "#f56565"
+    bg_accent     = "rgba(0,212,160,0.06)" if is_long else "rgba(245,101,101,0.05)"
+    dir_label     = sig["direction"]
+    z_meaning     = "Spread undervalued — buy A / sell B" if is_long else "Spread overvalued — sell A / buy B"
 
-# ==========================================
-# 1. SETUP & PARAMETERS
-# ==========================================
-PAIRS = [('XOM', 'CVX'), ('V', 'MA'), ('NVDA', 'AMD'), ('KO', 'PEP'), ('GOOGL', 'META')]
-ENTRY_Z, EXIT_Z, STOP_Z = 2.25, 0.0, 3.5
-ROLLING_WINDOW = 60
+    # Z-score bar (bidirectional)
+    z_pct = min(abs(sig["curr_z"]) / MAX_Z_VIZ, 1.0) * 50  # half of 100%
+    bar_left  = f"{50 - z_pct:.1f}%" if is_long else "50%"
+    bar_width = f"{z_pct:.1f}%"
 
-@st.cache_data(ttl=3600)
-def get_data():
-    tickers = list(set([t for p in PAIRS for t in p]))
-    # yfinance returns multi-index for multiple tickers, we extract just the 'Close'
-    data = yf.download(tickers, period="200d", interval="1d")['Close']
-    return data
+    # Execution legs
+    legs = compute_legs(sig)
+    leg1_verb, leg2_verb = ("BUY", "SELL") if is_long else ("SELL", "BUY")
+    leg1_col  = "#00d4a0" if is_long else "#f56565"
+    leg2_col  = "#f56565" if is_long else "#00d4a0"
 
-df_raw = get_data()
+    exec_html = f"""
+      <div style="background:#181c24;border-radius:3px;padding:10px 12px;margin-bottom:12px;">
+        <p style="margin:0 0 8px;font-size:9px;color:#4a5568;font-family:monospace;
+                  text-transform:uppercase;letter-spacing:0.1em;">Execution (Dollar-Neutral)</p>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
+          <span style="font-family:monospace;font-size:11px;font-weight:600;color:{leg1_col};
+                background:{"rgba(0,212,160,0.12)" if is_long else "rgba(245,101,101,0.1)"};
+                padding:2px 7px;border-radius:2px;">{leg1_verb}</span>
+          <span style="font-family:monospace;font-size:12px;color:#e8eaf0;padding:0 8px;">{sig['a']}</span>
+          <span style="font-family:monospace;font-size:11px;color:#8892a4;">{legs['shares_a']} shs @ ${sig['price_a']:.2f}</span>
+          <span style="font-family:monospace;font-size:11px;color:#4a5568;">${legs['notional_a']:,.0f}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-family:monospace;font-size:11px;font-weight:600;color:{leg2_col};
+                background:{"rgba(245,101,101,0.1)" if is_long else "rgba(0,212,160,0.12)"};
+                padding:2px 7px;border-radius:2px;">{leg2_verb}</span>
+          <span style="font-family:monospace;font-size:12px;color:#e8eaf0;padding:0 8px;">{sig['b']}</span>
+          <span style="font-family:monospace;font-size:11px;color:#8892a4;">{legs['shares_b']} shs @ ${sig['price_b']:.2f}</span>
+          <span style="font-family:monospace;font-size:11px;color:#4a5568;">${legs['notional_b']:,.0f}</span>
+        </div>
+        <p style="margin:8px 0 0;font-size:9px;color:#4a5568;font-family:monospace;text-align:right;">
+          Net imbalance: <span style="color:{"#00d4a0" if abs(legs['imbalance'])<500 else "#f5a623"}">
+            ${abs(legs['imbalance']):,.0f}</span>
+        </p>
+      </div>"""
 
-# ==========================================
-# 2. DATA PROCESSING ENGINE (QUANT UPGRADED)
-# ==========================================
-processed_data = []
-active_signals = []
+    # Signal quality pips
+    score  = score_signal(sig)
+    pip_on = "#00d4a0" if (is_long and sig["is_cointegrated"]) else ("#f56565" if not is_long else "#f5a623")
+    pips   = "".join([
+        f'<div style="width:14px;height:4px;border-radius:1px;background:{"" + pip_on if i < score else "#1e2330"};"></div>'
+        for i in range(5)
+    ])
 
-for ticker_a, ticker_b in PAIRS:
-    if ticker_a not in df_raw.columns or ticker_b not in df_raw.columns: 
-        continue
-    
-    pair_df = df_raw[[ticker_a, ticker_b]].dropna()
-    if len(pair_df) < ROLLING_WINDOW: 
-        continue
+    coint_color = "#00d4a0" if sig["is_cointegrated"] else "#f5a623"
+    coint_text  = f"Cointegrated (p={sig['adf_pval']:.3f})" if sig["is_cointegrated"] else f"NOT cointegrated (p={sig['adf_pval']:.2f})"
 
-    # 1. Rolling OLS for dynamic Beta (Prevents look-ahead bias)
-    endog = np.log(pair_df[ticker_a])
-    exog = sm.add_constant(np.log(pair_df[ticker_b]))
-    
-    try:
-        rols = RollingOLS(endog, exog, window=ROLLING_WINDOW).fit()
-        # Extract the rolling beta for ticker_b
-        rolling_betas = rols.params[ticker_b]
-        rolling_consts = rols.params['const']
-        
-        # Calculate dynamic spread
-        spread = endog - (rolling_betas * np.log(pair_df[ticker_b]) + rolling_consts)
-        spread = spread.dropna()
-        
-        # 2. Cointegration Check (ADF Test)
-        # p-value < 0.05 means the spread is mean-reverting (safe to trade)
-        adf_pval = adfuller(spread)[1]
-        is_cointegrated = adf_pval < 0.05
+    warn_banner = "" if sig["is_cointegrated"] else f"""
+      <div style="background:rgba(245,166,23,0.07);border-top:1px solid rgba(245,166,23,0.2);
+                  padding:7px 16px;display:flex;align-items:center;gap:8px;">
+        <span style="font-family:monospace;font-size:10px;font-weight:600;color:#f5a623;">!</span>
+        <span style="font-family:monospace;font-size:10px;color:rgba(245,166,23,0.8);">
+          Pair not cointegrated — reduce sizing, widen stop by 0.5σ
+        </span>
+      </div>"""
 
-        # 3. Z-Score Calculation
-        z_score_series = (spread - spread.rolling(ROLLING_WINDOW).mean()) / spread.rolling(ROLLING_WINDOW).std()
-        curr_z = z_score_series.iloc[-1]
-        
-        # Current Prices & Beta for execution sizing
-        price_a = pair_df[ticker_a].iloc[-1]
-        price_b = pair_df[ticker_b].iloc[-1]
-        curr_beta = rolling_betas.iloc[-1]
+    hl    = sig.get("half_life",    "–")
+    r2    = sig.get("r_squared",    None)
+    edge  = sig.get("edge_bps",     "–")
+    sharpe= sig.get("sharpe_est",   None)
+    lkbk  = sig.get("lookback",     63)
+    sharpe_color = "#00d4a0" if (sharpe and sharpe > 1.5) else "#f5a623"
 
-        is_active = abs(curr_z) >= ENTRY_Z
-        direction = "LONG" if curr_z <= -ENTRY_Z else "SHORT" if curr_z >= ENTRY_Z else "NEUTRAL"
-        
-        pair_info = {
-            'pair': f"{ticker_a} / {ticker_b}",
-            'a': ticker_a, 'b': ticker_b,
-            'price_a': price_a, 'price_b': price_b,
-            'curr_z': curr_z, 'beta': curr_beta, 
-            'z_series': z_score_series,
-            'is_active': is_active, 'direction': direction,
-            'is_cointegrated': is_cointegrated, 'adf_pval': adf_pval
-        }
-        processed_data.append(pair_info)
-        
-        if is_active:
-            active_signals.append(pair_info)
-            
-    except Exception as e:
-        st.error(f"Error processing {ticker_a}/{ticker_b}: {str(e)}")
+    metrics_html = f"""
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:14px;">
+        {"".join([
+          f'<div style="background:#181c24;padding:8px 10px;border-radius:3px;">'
+          f'<p style="margin:0 0 3px;font-size:9px;color:#4a5568;font-family:monospace;text-transform:uppercase;letter-spacing:0.08em;">{lab}</p>'
+          f'<p style="margin:0;font-family:monospace;font-size:13px;font-weight:500;color:{col};">{val}</p></div>'
+          for lab, val, col in [
+            ("Half-Life",  f"{hl:.1f}d" if isinstance(hl, float) else hl, "#e8eaf0"),
+            ("R²",         f"{r2*100:.0f}%" if r2 else "–", "#e8eaf0"),
+            ("Edge",       f"{edge}bps",                                   "#e8c96d"),
+            ("Sharpe Est", f"{sharpe:.1f}" if sharpe else "–",             sharpe_color),
+            ("ADF p-val",  f"{sig['adf_pval']:.3f}",                       "#00d4a0" if sig['adf_pval'] < 0.05 else "#f5a623"),
+            ("Lookback",   f"{lkbk}d",                                     "#e8eaf0"),
+          ]
+        ])}
+      </div>"""
 
-# ==========================================
-# 3. TOP DASHBOARD: OPEN TRADES SUMMARY
-# ==========================================
-st.subheader("⚡ Active Trade Summary & Execution Points")
+    return f"""
+    <div style="background:#111318;border-radius:4px;border:1px solid {"rgba(255,255,255,0.07)"};
+                overflow:hidden;margin-bottom:12px;position:relative;
+                border-top:2px solid {accent};background:{bg_accent};">
+      <div style="padding:14px 16px 12px;border-bottom:1px solid rgba(255,255,255,0.07);
+                  display:flex;justify-content:space-between;align-items:flex-start;">
+        <div>
+          <p style="margin:0;font-family:monospace;font-size:15px;font-weight:600;
+                    letter-spacing:0.04em;color:{accent};">
+            {sig['a']} <span style="color:#4a5568;font-weight:300;">/</span> {sig['b']}
+          </p>
+          <p style="margin:3px 0 0;font-size:10px;color:#4a5568;font-family:monospace;">
+            β={sig['beta']:.2f} · {lkbk}d lookback
+          </p>
+        </div>
+        <span style="font-family:monospace;font-size:9px;font-weight:600;letter-spacing:0.14em;
+              padding:3px 8px;border-radius:2px;
+              background:{"rgba(0,212,160,0.15)" if is_long else "rgba(245,101,101,0.15)"};
+              color:{accent};border:1px solid {"rgba(0,212,160,0.3)" if is_long else "rgba(245,101,101,0.3)"};">
+          {dir_label}
+        </span>
+      </div>
 
-if not active_signals:
-    st.info(f"No active signals. All Z-scores are currently between -{ENTRY_Z} and +{ENTRY_Z}. Waiting for deviations.")
-else:
-    # Use containers to wrap columns neatly if there are many active signals
-    cols = st.columns(3) 
-    for i, sig in enumerate(active_signals):
-        with cols[i % 3]:
-            color = "#28a745" if sig['direction'] == "LONG" else "#dc3545"
-            bg_color = "rgba(40, 167, 69, 0.1)" if sig['direction'] == "LONG" else "rgba(220, 53, 69, 0.1)"
-            
-            # Plain English Z-Score Translation
-            z_meaning = "Undervalued (Buy Spread)" if sig['direction'] == "LONG" else "Overvalued (Sell Spread)"
-            coint_warning = "" if sig['is_cointegrated'] else "<p style='color:#ffc107; font-size: 12px;'>⚠️ WARNING: Pair not cointegrated recently.</p>"
-            
-            # Stock Execution Logic
-            if sig['direction'] == "LONG":
-                exec_text = f"<b>BUY</b> 100 shrs {sig['a']} @ ${sig['price_a']:.2f}<br><b>SELL</b> {int(100 * sig['beta'])} shrs {sig['b']} @ ${sig['price_b']:.2f}"
-            else:
-                exec_text = f"<b>SELL</b> 100 shrs {sig['a']} @ ${sig['price_a']:.2f}<br><b>BUY</b> {int(100 * sig['beta'])} shrs {sig['b']} @ ${sig['price_b']:.2f}"
-
-            st.markdown(f"""
-                <div style="background-color:{bg_color}; padding: 15px; border-radius: 8px; border-top: 4px solid {color}; margin-bottom: 15px;">
-                    <h3 style="margin:0; font-size: 18px; color: {color};">{sig['direction']} {sig['a']} (vs {sig['b']})</h3>
-                    
-                    <div style="margin-top: 10px; padding-bottom: 5px; border-bottom: 1px solid rgba(255,255,255,0.1);">
-                        <p style="margin:0; font-size: 14px; color:
+      <div style="padding:14px 16px;">
+        <div style="display:flex;align-
