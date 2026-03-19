@@ -64,3 +64,30 @@ for i, (a, b) in enumerate(PAIRS):
 
     except Exception as e:
         st.error(f"Error on {a}/{b}")
+        # --- COPY EVERYTHING BELOW THIS LINE ---
+import streamlit as st
+
+def get_strategy_rec(z, vol):
+    if abs(z) < 2.25: return "No Signal", "Neutral", "Wait for Z > 2.25"
+    if vol > 0.25: return "RATIO BACKSPREAD", "High", "Sell 1 ATM / Buy 2 OTM"
+    elif vol > 0.12: return "VERTICAL SPREAD", "Medium", "Standard Bull/Bear Spread"
+    else: return "PURE STOCKS", "Low", "Buy/Short Shares (No Options)"
+
+st.divider()
+st.header("⚡ Omni-Arb Execution")
+
+# This tries to find your existing Z and Vol variables
+try:
+    # Use whatever variables your code uses (common ones below)
+    z_val = locals().get('z_score', locals().get('zscore', 0))
+    v_val = locals().get('volatility', locals().get('vol', 0.15))
+    
+    strat, v_level, action = get_strategy_rec(z_val, v_val)
+    
+    c1, c2 = st.columns(2)
+    c1.metric("Strategy", strat, f"Vol: {v_level}")
+    c2.info(f"**Instructions:** {action}")
+except Exception as e:
+    st.error("Check Step 3: Could not find Z-score variable.")
+# --- END OF PASTE ---
+
