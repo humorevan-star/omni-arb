@@ -6,7 +6,7 @@ import statsmodels.api as sm
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="Omni-Arb Command Center", layout="wide")
-st.title("🚀 Omni-Arb Live Monitor v3.1 – CLEAN EXECUTION")
+st.title("🚀 Omni-Arb Live Monitor v3.2 – FIXED")
 
 # 1. SETUP
 PAIRS = [('V', 'MA'), ('NVDA', 'AMD'), ('KO', 'PEP'), ('XOM', 'CVX'), ('GOOGL', 'META')]
@@ -46,46 +46,46 @@ for i, (a, b) in enumerate(PAIRS):
             st.subheader(f"Pair: {a} vs {b}")
             strat_name, strat_desc, dte = get_instrument_type(pair_vol)
 
-            # === HIGH VISIBILITY EXECUTION BANNER ===
+            # === FIXED SIGNAL BANNER ===
             if abs(curr_z) > ENTRY_Z:
-                color_theme = "lightgreen" if curr_z < 0 else "salmon"
+                color_theme = "#d4edda" if curr_z < 0 else "#f8d7da" # Soft Green / Soft Red
+                border_color = "green" if curr_z < 0 else "red"
                 direction = "LONG SPREAD (Buy A / Sell B)" if curr_z < 0 else "SHORT SPREAD (Sell A / Buy B)"
                 
-                # Green Background Box for Open Trades
+                # FIXED: Changed unsafe_with_html to unsafe_allow_html
                 st.markdown(f"""
-                    <div style="background-color:{color_theme}; padding:20px; border-radius:10px; border: 2px solid green;">
-                        <h2 style="color:black; margin:0;">🔥 SIGNAL DETECTED: {direction}</h2>
-                        <p style="color:black; font-size:18px;"><b>PRIMARY TRADE:</b> 100 shares of {a} vs {round(beta, 2)*100} shares of {b}</p>
+                    <div style="background-color:{color_theme}; padding:20px; border-radius:10px; border: 2px solid {border_color};">
+                        <h2 style="color:black; margin:0;">🔥 SIGNAL: {direction}</h2>
+                        <p style="color:black; font-size:18px;"><b>PRIMARY:</b> {a} Shares vs {b} Shares (Ratio: 1:{round(beta, 2)})</p>
                         <hr style="border-top: 1px solid black;">
-                        <p style="color:black;"><b>Optional Hedge:</b> {strat_name} on {a} ({dte})</p>
+                        <p style="color:black;"><b>HEDGE OPTION:</b> {strat_name} on {a} ({dte})</p>
                     </div>
-                """, unsafe_with_html=True)
-                st.write("") # Spacing
+                """, unsafe_allow_html=True)
+                st.write("") 
             else:
-                st.info(f"⚪ **NO TRADE** – Z-Score currently {curr_z:.2f}")
+                st.info(f"⚪ **NO TRADE** – Z-Score: {curr_z:.2f}")
 
-            # ==================== CHART WITH DYNAMIC LABELS ====================
+            # ==================== CHART WITH LABELS ====================
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=z_score_series.index, y=z_score_series, name="Z-Score", line=dict(color='cyan', width=2)))
 
-            # Define dynamic stop level based on position
-            current_stop = STOP_Z if curr_z > 0 else -STOP_Z
-
-            # Lines with fixed Z-number labels
-            fig.add_hline(y=ENTRY_Z, line_dash="dash", line_color="red", annotation_text=f"ENTRY ({ENTRY_Z})")
-            fig.add_hline(y=-ENTRY_Z, line_dash="dash", line_color="red", annotation_text=f"ENTRY (-{ENTRY_Z})")
-            fig.add_hline(y=EXIT_Z, line_dash="dot", line_color="lime", annotation_text=f"EXIT ({EXIT_Z})")
-            fig.add_hline(y=current_stop, line_dash="dash", line_color="orange", annotation_text=f"STOP ({current_stop})")
+            # Static markers for Entry/Exit/Stop
+            fig.add_hline(y=ENTRY_Z, line_dash="dash", line_color="red", annotation_text=f"ENTRY ({ENTRY_Z})", annotation_position="top right")
+            fig.add_hline(y=-ENTRY_Z, line_dash="dash", line_color="red", annotation_text=f"ENTRY (-{ENTRY_Z})", annotation_position="bottom right")
+            fig.add_hline(y=0, line_dash="dot", line_color="lime", annotation_text="EXIT (0.0)", annotation_position="top right")
+            
+            # Dynamic Stop Loss Line
+            stop_val = STOP_Z if curr_z > 0 else -STOP_Z
+            fig.add_hline(y=stop_val, line_dash="dash", line_color="orange", annotation_text=f"STOP ({stop_val})")
 
             fig.update_layout(
                 template="plotly_dark", height=380, margin=dict(l=10, r=10, t=30, b=10),
-                title=f"Z-Score Path (Current: {curr_z:.2f})",
-                yaxis=dict(range=[-4, 4]) # Keeps charts consistent
+                yaxis=dict(range=[-4, 4])
             )
 
             st.plotly_chart(fig, use_container_width=True)
-            st.caption(f"**Stats:** Beta: {beta:.2f} | Spread Vol: {pair_vol:.1%}")
+            st.caption(f"**Current Z:** {curr_z:.2f} | **Spread Vol:** {pair_vol:.1%}")
             st.divider()
 
     except Exception as e:
-        with cols[i % 2]: st.error(f"Error: {str(e)}")
+        with cols[i % 2]: st.error(f"Error on {a}/{b}: {str(e)}")
