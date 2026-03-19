@@ -6,7 +6,7 @@ import statsmodels.api as sm
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="Omni-Arb Dashboard", layout="wide")
-st.title("🚀 Omni-Arb Live Monitor v2.6 – FOOLPROOF EDITION")
+st.title("🚀 Omni-Arb Live Monitor v2.7 – FOOLPROOF TICKER EDITION")
 
 st.sidebar.header("📌 How to Use This Dashboard")
 st.sidebar.markdown("""
@@ -14,8 +14,8 @@ st.sidebar.markdown("""
 - **ENTRY** → |Z| > 2.25  
 - **EXIT / COVER** → Z returns to 0  
 - **STOP LOSS** → |Z| > 3.5 (exit immediately, take the loss)
-- All trades are **exactly** described below with ticker, legs, ratio, and exact DTE.
-- Chart now has **clear visual signals** (colored lines + labels).
+- Every trade now shows **exact ticker** on every leg (buy/sell line).
+- Chart has **clear visual signals** (colored lines + labels).
 """)
 
 # 1. SETUP – UNCHANGED THRESHOLDS
@@ -68,17 +68,17 @@ for i, (a, b) in enumerate(PAIRS):
 
                 st.success(f"**STRATEGY:** {strat_name} ({dte})")
 
-                # ==================== EXACT TRADE INSTRUCTIONS ====================
+                # ==================== EXACT TRADE INSTRUCTIONS WITH TICKERS ====================
                 main_ticker = a
 
                 if strat_name == "RATIO BACKSPREAD":
-                    opt_type = "Puts" if curr_z > 0 else "Calls"   # Bearish = Puts, Bullish = Calls
+                    opt_type = "Puts" if curr_z > 0 else "Calls"
                     st.info(f"""
 **TRADE OPTIONS ON {main_ticker}**  
 **RATIO BACKSPREAD (60-70 Days Out)**
 
-1. **Sell (1)** At-the-Money {opt_type}  
-2. **Buy (2)** Out-of-the-Money {opt_type}  
+1. **Sell (1)** {main_ticker} At-the-Money {opt_type}  
+2. **Buy (2)** {main_ticker} Out-of-the-Money {opt_type}  
 
 **Expiration:** 60-70 Days Out  
 **Ratio:** 1:2  
@@ -92,8 +92,8 @@ for i, (a, b) in enumerate(PAIRS):
 **VERTICAL SPREAD (30-45 Days Out)**
 
 **Bull Call Debit Spread**  
-1. Buy 1 At-the-Money Call  
-2. Sell 1 Out-of-the-Money Call (higher strike)
+1. **Buy 1** {main_ticker} At-the-Money Call  
+2. **Sell 1** {main_ticker} Out-of-the-Money Call (higher strike)
 
 **Expiration:** 30-45 Days Out  
 **Max Loss:** Net debit | **Max Profit:** Limited
@@ -104,19 +104,21 @@ for i, (a, b) in enumerate(PAIRS):
 **VERTICAL SPREAD (30-45 Days Out)**
 
 **Bear Put Debit Spread**  
-1. Buy 1 At-the-Money Put  
-2. Sell 1 Out-of-the-Money Put (lower strike)
+1. **Buy 1** {main_ticker} At-the-Money Put  
+2. **Sell 1** {main_ticker} Out-of-the-Money Put (lower strike)
 
 **Expiration:** 30-45 Days Out  
 **Max Loss:** Net debit | **Max Profit:** Limited
 """)
 
                 else:  # PURE STOCKS
+                    action_a = "Short" if curr_z > 0 else "Buy"
+                    action_b = "Buy" if curr_z > 0 else "Short"
                     st.info(f"""
 **STOCK-ONLY TRADE (No Options)**
 
-**{a}** : {'Short' if curr_z > 0 else 'Buy'}  
-**{b}** : {'Buy' if curr_z > 0 else 'Short'}
+1. **{action_a} 100 shares of {a}**  
+2. **{action_b} 100 shares of {b}**
 
 **No expiration** – Hold until Z returns to 0 or stop loss
 """)
