@@ -637,16 +637,52 @@ def main():
             fig.add_hline(y=-STOP_Z,  line=dict(color="#f5a623", width=2.2, dash="dash"),
                           annotation_text="STOP LOSS (-3.5)",   annotation_position="bottom right")
 
-            last_date   = z_data.index[-1]
-            x_range_end = last_date + (last_date - z_data.index[0]) * 0.15
+            last_date    = z_data.index[-1]
+            one_year_ago = last_date - pd.DateOffset(years=1)
+            # Clamp to available data if history is shorter than 1 year
+            x_start      = max(one_year_ago, z_data.index[0])
+            # 5% right padding so annotations don't clip
+            x_pad        = (last_date - x_start) * 0.05
+            x_end        = last_date + x_pad
+
+            # Auto-fit y to the visible 1-year window + 15% breathing room
+            visible_z    = z_data[z_data.index >= x_start]
+            y_min        = visible_z.min()
+            y_max        = visible_z.max()
+            y_pad        = (y_max - y_min) * 0.15 if (y_max - y_min) > 0 else 0.5
+            # Always show at least ±STOP_Z so threshold lines stay visible
+            y_lo         = min(y_min - y_pad, -STOP_Z - 0.3)
+            y_hi         = max(y_max + y_pad,  STOP_Z + 0.3)
 
             fig.update_layout(
                 template="plotly_dark", height=380,
                 margin=dict(l=10, r=10, t=30, b=10),
                 paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
                 showlegend=False,
-                xaxis=dict(range=[z_data.index[0], x_range_end], showgrid=False),
-                yaxis=dict(range=[-4, 4], showgrid=False, zeroline=False),
+                xaxis=dict(
+                    range=[x_start, x_end],
+                    showgrid=False,
+                    # rangeslider lets users zoom further back interactively
+                    rangeslider=dict(visible=False),
+                    rangeselector=dict(
+                        bgcolor="#111318",
+                        activecolor="#00d1ff",
+                        bordercolor="rgba(255,255,255,0.1)",
+                        font=dict(family="IBM Plex Mono", size=10, color="#8892a4"),
+                        buttons=[
+                            dict(count=3,  label="3M", step="month", stepmode="backward"),
+                            dict(count=6,  label="6M", step="month", stepmode="backward"),
+                            dict(count=1,  label="1Y", step="year",  stepmode="backward"),
+                            dict(step="all", label="All"),
+                        ],
+                    ),
+                ),
+                yaxis=dict(
+                    range=[y_lo, y_hi],
+                    showgrid=False,
+                    zeroline=False,
+                    autorange=False,
+                ),
                 font=dict(family="IBM Plex Mono"),
             )
 
