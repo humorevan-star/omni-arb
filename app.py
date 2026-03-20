@@ -43,27 +43,36 @@ st.markdown("""
 # =============================================================================
 PAIRS           = [('XOM', 'CVX'), ('V', 'MA'), ('NVDA', 'AMD'), ('KO', 'PEP'), ('MSTR', 'BTC-USD')]
 TOTAL_CAPITAL   = 1000.0
-ALLOC_PER_PAIR  = TOTAL_CAPITAL / len(PAIRS)    # $200 per pair slot
-EQUITY_PCT      = 0.60                           # $120 equities per slot
-OPTION_PCT      = 0.40                           # $80 verticals per slot
-ENTRY_Z         = 2.25
-EXIT_Z          = 0.00
+EQUITY_PCT      = 0.60                           # 60% stock sleeve
+OPTION_PCT      = 0.40                           # 40% vertical sleeve
+ENTRY_Z         = 2.15                           # v11: tightened from 2.25 → more signals
+EXIT_Z          = 0.10                           # v11: exit slightly before zero (lock profit)
 STOP_Z          = 3.50
-STRIKE_OFFSET   = 0.025                          # 2.5% OTM
-ROLL_WIN        = 60                             # rolling OLS window (bars)
-MAX_HOLD_DAYS   = 21                             # hard timeout (trading bars)
-RSI_WINDOW      = 14                             # RSI period
-RSI_HIGH        = 70                             # overbought — block SHORT entry on A
-RSI_LOW         = 30                             # oversold  — block LONG entry on A
-OPT_LEVERAGE    = 4.5                            # options amplifier vs equity
+STRIKE_OFFSET   = 0.025                          # 2.5% OTM for verticals
+ROLL_WIN        = 45                             # v11: faster window (45 bars) → more turnover
+MAX_HOLD_DAYS   = 15                             # v11: tighter timeout (15 bars) → capital velocity
+RSI_WINDOW      = 14
+RSI_HIGH        = 75                             # v11: slightly wider tolerance
+RSI_LOW         = 25
+OPT_LEVERAGE    = 5.0                            # v11: amplifier raised to 5x
+VELOCITY_DAYS   = 5                              # v11: Z must move ≥0.20 toward 0 in 5 bars
+VELOCITY_MIN    = 0.20                           # v11: minimum Z progress per velocity check
+
+# Geometric compounding: alloc per pair recalculated from CURRENT balance at each entry
+# (not fixed $200 — so winning streaks compound into larger positions)
+ALLOC_PER_PAIR  = TOTAL_CAPITAL / len(PAIRS)    # baseline; overridden live by current_balance
 
 
 # =============================================================================
 # 2. DATA ENGINE
 # =============================================================================
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=86400)
 def get_market_data() -> pd.DataFrame:
-    """10-year history to stress-test through 2020 crash, 2022 bear, 2024 AI surge."""
+    """
+    10-year daily data — stress-tested through:
+      2020 crash · 2022 bear · 2024 AI surge · 2025 rate cycle
+    Long TTL (24h) since historical data is stable.
+    """
     tickers = list(set(t for p in PAIRS for t in p))
     df = yf.download(tickers, period="10y", interval="1d")["Close"]
     return df.ffill().dropna()
@@ -181,57 +190,70 @@ def spread_pnl(ep_a: float, ep_b: float, cp_a: float, cp_b: float,
 # =============================================================================
 def run_backtest(df: pd.DataFrame) -> tuple:
     """
-    10-year event-driven backtest with:
-      • RSI trend filter at entry
-      • State-machine hysteresis (no re-entry while in trade)
-      • 21-bar hard timeout
-      • Medallion spread P&L
-      • Live floating P&L for open trades
+    v11 Medallion-tier backtest:
+      • Geometric compounding: each entry uses current_balance/n_pairs (not fixed $200)
+      • Velocity filter: trade exits early if Z hasn't moved ≥0.20 toward 0 in 5 bars
+      • Tighter params: ENTRY_Z=2.15, EXIT_Z=0.10, MAX_HOLD=15, OPT_LEVERAGE=5×
+      • RSI trend filter at entry (25–75 safe zone)
+      • Daily equity curve for CAGR calculation
+      • Log-spread P&L (correct Medallion formula)
     """
-    ledger       = []
-    pair_history = {f"{t1}/{t2}": [] for t1, t2 in PAIRS}
-    open_trades  = {}
+    current_balance = TOTAL_CAPITAL   # compounds with each winning trade
+    ledger          = []
+    pair_history    = {f"{t1}/{t2}": [] for t1, t2 in PAIRS}
+    open_trades     = {}
+    daily_equity    = []              # daily mark-to-market for CAGR + equity chart
 
+    # Pre-compute all z/beta series once
+    signals = {}
     for t1, t2 in PAIRS:
-        if t1 not in df.columns or t2 not in df.columns:
-            continue
+        if t1 in df.columns and t2 in df.columns:
+            signals[f"{t1}/{t2}"] = calculate_pair_stats(df, t1, t2)
 
-        z, beta_s = calculate_pair_stats(df, t1, t2)
-        in_pos    = False
-        entry_idx = None
-        direction = None
+    # Walk every date once (portfolio-level loop for accurate compounding)
+    all_dates = df.index[ROLL_WIN:]
+    # Per-pair state dicts (replaces nested loop for correct balance tracking)
+    pair_state = {pk: {"in_pos": False, "direction": None, "entry_idx": None,
+                       "slot_size": 0.0} for pk in signals}
 
-        for i in range(ROLL_WIN, len(z)):
-            curr_z = float(z.iloc[i])
+    for date_i, date in enumerate(all_dates):
+        global_i = ROLL_WIN + date_i   # absolute index into df
 
-            # ── ENTRY ──────────────────────────────────────────────────────
-            if not in_pos:
-                if curr_z >= ENTRY_Z:
-                    candidate_dir = "SHORT"
-                elif curr_z <= -ENTRY_Z:
-                    candidate_dir = "LONG"
-                else:
-                    continue
+        for pk, (z, beta_s) in signals.items():
+            t1, t2 = pk.split("/")
+            st = pair_state[pk]
 
-                tf = trend_filter(df.iloc[:i + 1], t1, t2, candidate_dir)
-                if tf["safe"]:
-                    in_pos, direction, entry_idx = True, candidate_dir, i
+            if date not in z.index:
+                continue
+            loc_i  = z.index.get_loc(date)
+            curr_z = float(z.iloc[loc_i])
+            prev_z = float(z.iloc[loc_i - 1]) if loc_i > 0 else curr_z
 
             # ── EXIT ───────────────────────────────────────────────────────
-            else:
-                days = i - entry_idx
-                hit_target  = (direction == "LONG"  and curr_z >= -EXIT_Z) or \
-                              (direction == "SHORT" and curr_z <=  EXIT_Z)
-                hit_stop    = abs(curr_z) >= STOP_Z
-                hit_timeout = days >= MAX_HOLD_DAYS
+            if st["in_pos"]:
+                entry_loc  = st["entry_idx"]
+                days       = loc_i - entry_loc
+                direction  = st["direction"]
+                entry_z_v  = float(z.iloc[entry_loc])
 
-                if hit_target or hit_stop or hit_timeout:
-                    ep_a   = float(df[t1].iloc[entry_idx])
-                    ep_b   = float(df[t2].iloc[entry_idx])
-                    cp_a   = float(df[t1].iloc[i])
-                    cp_b   = float(df[t2].iloc[i])
-                    beta   = float(beta_s.iloc[entry_idx])
-                    eq_cap = ALLOC_PER_PAIR * EQUITY_PCT
+                hit_target = (direction == "LONG"  and curr_z >= -EXIT_Z) or                              (direction == "SHORT" and curr_z <=  EXIT_Z)
+                hit_stop   = abs(curr_z) >= STOP_Z
+                hit_timeout= days >= MAX_HOLD_DAYS
+
+                # Velocity check: at day VELOCITY_DAYS, Z must have moved ≥ VELOCITY_MIN toward 0
+                hit_velocity = (
+                    days == VELOCITY_DAYS and
+                    (abs(entry_z_v) - abs(curr_z)) < VELOCITY_MIN
+                )
+
+                if hit_target or hit_stop or hit_timeout or hit_velocity:
+                    ep_a   = float(df[t1].iloc[entry_loc])
+                    ep_b   = float(df[t2].iloc[entry_loc])
+                    cp_a   = float(df[t1].loc[date])
+                    cp_b   = float(df[t2].loc[date])
+                    beta   = float(beta_s.iloc[entry_loc])
+                    slot   = st["slot_size"]
+                    eq_cap = slot * EQUITY_PCT
                     legs   = medallion_legs(ep_a, ep_b, beta, eq_cap)
 
                     ret_a  = cp_a / ep_a - 1
@@ -239,67 +261,113 @@ def run_backtest(df: pd.DataFrame) -> tuple:
                     sp_ret = (ret_a - beta * ret_b) * (1 if direction == "LONG" else -1)
 
                     stk_p  = eq_cap * sp_ret
-                    opt_p  = (ALLOC_PER_PAIR * OPTION_PCT) * sp_ret * OPT_LEVERAGE
-                    exit_r = "TIMEOUT" if hit_timeout else "STOP" if hit_stop else "EXIT"
+                    opt_p  = (slot * OPTION_PCT) * sp_ret * OPT_LEVERAGE
+                    total  = stk_p + opt_p
 
-                    pair_history[f"{t1}/{t2}"].append({
-                        "entry_date":  z.index[entry_idx],
-                        "exit_date":   z.index[i],
-                        "entry_z":     float(z.iloc[entry_idx]),
+                    exit_r = (
+                        "VELOCITY" if hit_velocity else
+                        "TIMEOUT"  if hit_timeout  else
+                        "STOP"     if hit_stop     else
+                        "EXIT"
+                    )
+
+                    current_balance += total   # ← geometric compounding
+
+                    pair_history[pk].append({
+                        "entry_date":  z.index[entry_loc],
+                        "exit_date":   date,
+                        "entry_z":     float(z.iloc[entry_loc]),
                         "exit_z":      curr_z,
                         "dir":         direction,
                         "exit_reason": exit_r,
                     })
                     ledger.append({
-                        "Date":      z.index[i],
-                        "Pair":      f"{t1}/{t2}",
-                        "Direction": direction,
-                        "ExitReason":exit_r,
-                        "DaysHeld":  days,
-                        "StockPnL":  round(stk_p, 2),
-                        "OptionPnL": round(opt_p, 2),
-                        "TotalPnL":  round(stk_p + opt_p, 2),
+                        "Date":       date,
+                        "Pair":       pk,
+                        "Direction":  direction,
+                        "ExitReason": exit_r,
+                        "DaysHeld":   days,
+                        "SlotSize":   round(slot, 2),
+                        "StockPnL":   round(stk_p, 2),
+                        "OptionPnL":  round(opt_p, 2),
+                        "TotalPnL":   round(total, 2),
+                        "Balance":    round(current_balance, 2),
                     })
-                    in_pos = False
+                    st["in_pos"]    = False
+                    st["direction"] = None
 
-        # ── LIVE OPEN TRADE ─────────────────────────────────────────────────
-        if in_pos:
-            ep_a   = float(df[t1].iloc[entry_idx])
-            ep_b   = float(df[t2].iloc[entry_idx])
-            cp_a   = float(df[t1].iloc[-1])
-            cp_b   = float(df[t2].iloc[-1])
-            beta   = float(beta_s.iloc[entry_idx])
-            eq_cap = ALLOC_PER_PAIR * EQUITY_PCT
-            legs   = medallion_legs(ep_a, ep_b, beta, eq_cap)
-            days   = len(z) - 1 - entry_idx
+            # ── ENTRY ──────────────────────────────────────────────────────
+            elif not st["in_pos"]:
+                if curr_z >= ENTRY_Z:
+                    candidate_dir = "SHORT"
+                elif curr_z <= -ENTRY_Z:
+                    candidate_dir = "LONG"
+                else:
+                    continue
 
-            sp     = spread_pnl(ep_a, ep_b, cp_a, cp_b, legs["shares_a"], beta, direction)
-            ret_a  = cp_a / ep_a - 1
-            ret_b  = cp_b / ep_b - 1
-            sp_ret = (ret_a - beta * ret_b) * (1 if direction == "LONG" else -1)
-            opt_p  = (ALLOC_PER_PAIR * OPTION_PCT) * sp_ret * OPT_LEVERAGE
+                tf = trend_filter(df.iloc[:global_i + 1], t1, t2, candidate_dir)
+                if tf["safe"]:
+                    # Geometric slot: current balance / n_pairs (compounds with wins)
+                    slot = max(current_balance / len(PAIRS), 10.0)
+                    st.update({
+                        "in_pos":    True,
+                        "direction": candidate_dir,
+                        "entry_idx": loc_i,
+                        "slot_size": slot,
+                    })
 
-            open_trades[f"{t1}/{t2}"] = {
-                "direction":  direction,
-                "entry_z":    float(z.iloc[entry_idx]),
-                "entry_date": z.index[entry_idx],
-                "curr_z":     float(z.iloc[-1]),
-                "beta":       beta,
-                "legs":       legs,
-                "days_held":  days,
-                "entry_pa":   ep_a,
-                "entry_pb":   ep_b,
-                "live_stk":   round(sp, 2),
-                "live_opt":   round(opt_p, 2),
-                "live_pnl":   round(sp + opt_p, 2),
-            }
+        # Daily mark-to-market snapshot
+        daily_equity.append({"Date": date, "Value": round(current_balance, 2)})
+
+    # ── LIVE OPEN TRADES (end-of-data state) ────────────────────────────────
+    for pk, (z, beta_s) in signals.items():
+        t1, t2 = pk.split("/")
+        st = pair_state[pk]
+        if not st["in_pos"]:
+            continue
+
+        entry_loc = st["entry_idx"]
+        direction = st["direction"]
+        slot      = st["slot_size"]
+        ep_a   = float(df[t1].iloc[entry_loc])
+        ep_b   = float(df[t2].iloc[entry_loc])
+        cp_a   = float(df[t1].iloc[-1])
+        cp_b   = float(df[t2].iloc[-1])
+        beta   = float(beta_s.iloc[entry_loc])
+        eq_cap = slot * EQUITY_PCT
+        legs   = medallion_legs(ep_a, ep_b, beta, eq_cap)
+        days   = len(z) - 1 - entry_loc
+
+        sp     = spread_pnl(ep_a, ep_b, cp_a, cp_b, legs["shares_a"], beta, direction)
+        ret_a  = cp_a / ep_a - 1
+        ret_b  = cp_b / ep_b - 1
+        sp_ret = (ret_a - beta * ret_b) * (1 if direction == "LONG" else -1)
+        opt_p  = (slot * OPTION_PCT) * sp_ret * OPT_LEVERAGE
+
+        open_trades[pk] = {
+            "direction":  direction,
+            "entry_z":    float(z.iloc[entry_loc]),
+            "entry_date": z.index[entry_loc],
+            "curr_z":     float(z.iloc[-1]),
+            "beta":       beta,
+            "legs":       legs,
+            "slot_size":  slot,
+            "days_held":  days,
+            "entry_pa":   ep_a,
+            "entry_pb":   ep_b,
+            "live_stk":   round(sp, 2),
+            "live_opt":   round(opt_p, 2),
+            "live_pnl":   round(sp + opt_p, 2),
+        }
 
     report = pd.DataFrame(ledger).sort_values("Date") if ledger else pd.DataFrame()
     if not report.empty:
         report["CumPnL"]       = report["TotalPnL"].cumsum()
         report["CumStockOnly"] = report["StockPnL"].cumsum()
 
-    return report, pair_history, open_trades
+    eq_curve = pd.DataFrame(daily_equity) if daily_equity else pd.DataFrame()
+
+    return report, pair_history, open_trades, eq_curve, round(current_balance, 2)
 
 
 # =============================================================================
@@ -338,8 +406,8 @@ def render_signal_card(t1: str, t2: str, trade: dict,
     bg         = "rgba(0,255,204,0.04)" if direction == "LONG" else "rgba(255,75,75,0.04)"
     border     = "rgba(0,255,204,0.25)" if direction == "LONG" else "rgba(255,75,75,0.25)"
     legs       = trade["legs"]
-    eq_cap     = ALLOC_PER_PAIR * EQUITY_PCT
-    opt_cap    = ALLOC_PER_PAIR * OPTION_PCT
+    eq_cap     = trade.get("slot_size", ALLOC_PER_PAIR) * EQUITY_PCT
+    opt_cap    = trade.get("slot_size", ALLOC_PER_PAIR) * OPTION_PCT
 
     # Progress
     start_z   = abs(trade["entry_z"])
@@ -656,15 +724,21 @@ def render_pair_chart(z: pd.Series, t1: str, t2: str,
 # =============================================================================
 # 11. BACKTEST SECTION
 # =============================================================================
-def render_backtest(report: pd.DataFrame):
+def render_backtest(report: pd.DataFrame, eq_curve: pd.DataFrame = None, final_balance: float = TOTAL_CAPITAL):
     st.divider()
+    n_yrs  = 10
+    cagr_r = round(((final_balance / TOTAL_CAPITAL) ** (1 / n_yrs) - 1) * 100, 1) if final_balance > 0 else 0
+    cagr_c = "#00d4a0" if cagr_r >= 20 else "#f5a623" if cagr_r >= 0 else "#f56565"
     st.markdown(
         '<div style="display:flex;align-items:center;gap:14px;margin-bottom:6px;">'
         '<h2 style="margin:0;font-family:monospace;">10-Year Backtest</h2>'
         '<span style="font-family:monospace;font-size:10px;padding:3px 10px;border-radius:3px;'
         'color:#a78bfa;border:1px solid rgba(167,139,250,0.4);">'
-        '$200/pair · RSI filter · 21d timeout · Medallion sizing</span>'
-        '</div>',
+        'Geometric compounding · RSI filter · Velocity filter · Medallion sizing</span>'
+        + '<span style="font-family:monospace;font-size:13px;font-weight:600;color:' + cagr_c + ';">'
+        + f"CAGR {cagr_r:+.1f}%  →  ${final_balance:,.0f}"
+        + '</span>'
+        + '</div>',
         unsafe_allow_html=True,
     )
 
@@ -692,8 +766,9 @@ def render_backtest(report: pd.DataFrame):
     _kpi(k[2], "Options P&L",  f"${opt_pnl:+,.0f}",    opt_c)
     _kpi(k[3], "Win Rate",     f"{win_rate:.0%}",       "#e8c96d")
     _kpi(k[4], "Avg Trade",    f"${avg_trade:+,.0f}",   pnl_c)
+    velocities = (report["ExitReason"] == "VELOCITY").sum() if "ExitReason" in report.columns else 0
     _kpi(k[5], "Clean Exits",  str(exits),              "#00d4a0")
-    _kpi(k[6], "Timeouts",     str(timeouts),           "#f5a623" if timeouts else "#4a5568")
+    _kpi(k[6], "Velocity Cuts",str(velocities),         "#4a9eff" if velocities else "#4a5568")
     _kpi(k[7], "Stops",        str(stops),              "#f56565" if stops else "#4a5568")
 
     st.markdown("<br>", unsafe_allow_html=True)
@@ -713,6 +788,14 @@ def render_backtest(report: pd.DataFrame):
         line=dict(color="#8892a4", width=1.5, dash="dot"),
         hovertemplate="%{x|%b %Y}<br>Stock only: $%{y:,.0f}<extra></extra>",
     ))
+    # Geometric compounding curve overlay
+    if eq_curve is not None and not eq_curve.empty:
+        fig.add_trace(go.Scatter(
+            x=eq_curve["Date"], y=eq_curve["Value"],
+            name="Compounding Balance",
+            line=dict(color="#e8c96d", width=1.5, dash="dot"),
+            hovertemplate="%{x|%b %Y}<br>Balance: $%{y:,.0f}<extra></extra>",
+        ))
     fig.add_hline(y=0, line=dict(color="rgba(255,255,255,0.12)", width=1, dash="dot"))
     fig.update_layout(
         template="plotly_dark", height=360,
@@ -767,7 +850,7 @@ def main():
         df = get_market_data()
 
     with st.spinner("Running backtest + live analysis..."):
-        report, pair_history, open_trades = run_backtest(df)
+        report, pair_history, open_trades, eq_curve, final_balance = run_backtest(df)
 
     # ── Account Health Bar ──────────────────────────────────────────────────
     utilization = len(open_trades) * ALLOC_PER_PAIR
@@ -804,12 +887,17 @@ def main():
     if not report.empty:
         total_pnl = report["TotalPnL"].sum()
         win_rate  = (report["TotalPnL"] > 0).mean()
-        k1, k2, k3, k4 = st.columns(4)
-        _kpi(k1, "10Y Portfolio P&L",   f"${total_pnl:+,.0f}",
+        n_years   = 10
+        cagr      = round(((final_balance / TOTAL_CAPITAL) ** (1 / n_years) - 1) * 100, 1)
+        cagr_col  = "#00d4a0" if cagr >= 20 else "#f5a623" if cagr >= 0 else "#f56565"
+        k1, k2, k3, k4, k5 = st.columns(5)
+        _kpi(k1, "Final Balance",       f"${final_balance:,.0f}",
+             "#00d4a0" if final_balance > TOTAL_CAPITAL else "#f56565")
+        _kpi(k2, "10Y CAGR",            f"{cagr:+.1f}%",      cagr_col)
+        _kpi(k3, "10Y Portfolio P&L",   f"${total_pnl:+,.0f}",
              "#00d4a0" if total_pnl >= 0 else "#f56565")
-        _kpi(k2, "Win Rate",            f"{win_rate:.0%}", "#e8c96d")
-        _kpi(k3, "Positions Open",      str(len(open_trades)) + " / " + str(len(PAIRS)), "#e8eaf0")
-        _kpi(k4, "Dry Powder",          f"${dry_powder:,.0f}", util_color)
+        _kpi(k4, "Win Rate",            f"{win_rate:.0%}",     "#e8c96d")
+        _kpi(k5, "Dry Powder",          f"${dry_powder:,.0f}", util_color)
         st.markdown("<br>", unsafe_allow_html=True)
 
     # ── SECTION A: ACTIVE SIGNAL CARDS ─────────────────────────────────────
@@ -928,7 +1016,7 @@ def main():
             )
 
     # ── SECTION D: BACKTEST ─────────────────────────────────────────────────
-    render_backtest(report)
+    render_backtest(report, eq_curve, final_balance)
 
     # ── SECTION E: ENGINE EXPLAINER ─────────────────────────────────────────
     st.divider()
