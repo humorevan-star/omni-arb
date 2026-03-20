@@ -152,15 +152,35 @@ def compute_rsi(series: pd.Series, window: int = 14) -> float:
 
 
 def calc_stats(curve: pd.Series, initial: float, years: float, rf: float = 0.045) -> dict:
-    """Compute CAGR, Sharpe, max drawdown, win rate from equity curve."""
-    final = float(curve.iloc[-1])
-    cagr  = ((final / initial) ** (1 / max(years, 0.1)) - 1) * 100
-    rets  = curve.pct_change().dropna()
-    excess = rets - rf / 252
-    sharpe = float(excess.mean() / excess.std() * np.sqrt(252)) if excess.std() > 0 else 0
-    roll_max = curve.cummax()
-    mdd = float(((curve - roll_max) / roll_max).min() * 100)
-    return {"final": final, "cagr": cagr, "sharpe": sharpe, "mdd": mdd}
+    """Compute CAGR, Sharpe, max drawdown from equity curve. NaN-safe."""
+    empty = {"final": initial, "cagr": 0.0, "sharpe": 0.0, "mdd": 0.0}
+    if curve is None or len(curve) < 5:
+        return empty
+    curve = curve.dropna()
+    if len(curve) < 5:
+        return empty
+    try:
+        final  = float(curve.iloc[-1])
+        if not np.isfinite(final) or final <= 0:
+            return empty
+        cagr   = ((final / initial) ** (1 / max(years, 0.1)) - 1) * 100
+        rets   = curve.pct_change().dropna()
+        rets   = rets[np.isfinite(rets)]
+        if len(rets) < 5 or rets.std() == 0:
+            sharpe = 0.0
+        else:
+            excess = rets - rf / 252
+            sharpe = float(excess.mean() / excess.std() * np.sqrt(252))
+        roll_max = curve.cummax()
+        dd_vals  = ((curve - roll_max) / roll_max).replace([np.inf, -np.inf], np.nan).dropna()
+        mdd      = float(dd_vals.min() * 100) if len(dd_vals) > 0 else 0.0
+        # Clamp to sane ranges
+        cagr   = max(-99.0, min(cagr,   999.0))
+        sharpe = max(-10.0, min(sharpe, 20.0))
+        mdd    = max(-100.0, min(mdd,   0.0))
+        return {"final": final, "cagr": cagr, "sharpe": sharpe, "mdd": mdd}
+    except Exception:
+        return empty
 
 
 # =============================================================================
@@ -368,7 +388,10 @@ def run_short_term_momentum(df: pd.DataFrame, capital: float) -> tuple:
 
         daily_eq.append({"Date": date, "Value": round(balance, 4)})
 
-    eq = pd.DataFrame(daily_eq).set_index("Date")["Value"]
+    if not daily_eq:
+        eq = pd.Series(dtype=float, name="Value")
+    else:
+        eq = pd.DataFrame(daily_eq).set_index("Date")["Value"]
     report = pd.DataFrame(ledger) if ledger else pd.DataFrame()
     return eq, report
 
@@ -427,7 +450,10 @@ def run_cross_sectional_momentum(df: pd.DataFrame, capital: float) -> tuple:
 
         daily_eq.append({"Date": date, "Value": round(balance, 4)})
 
-    eq = pd.DataFrame(daily_eq).set_index("Date")["Value"]
+    if not daily_eq:
+        eq = pd.Series(dtype=float, name="Value")
+    else:
+        eq = pd.DataFrame(daily_eq).set_index("Date")["Value"]
     report = pd.DataFrame(ledger) if ledger else pd.DataFrame()
     return eq, report
 
@@ -483,24 +509,45 @@ def run_vol_premium(df: pd.DataFrame, capital: float) -> tuple:
 # =============================================================================
 # 8. PORTFOLIO COMBINER  (align + sum all alpha curves)
 # =============================================================================
+def _safe_pnl(eq: pd.Series, cap: float, index) -> pd.Series:
+    """
+    Reindex equity curve to target index, forward-fill gaps.
+    Before first observation, assume 0 P&L (capital sitting idle).
+    """
+    s = eq.reindex(index)
+    # Fill from the first real value backward with cap (no P&L yet)
+    first_valid = s.first_valid_index()
+    if first_valid is not None:
+        s.loc[:first_valid] = s.loc[first_valid]
+    s = s.ffill().bfill()
+    return s.fillna(cap) - cap
+
+
 def combine_strategies(eq_sa, eq_stm, eq_csm, eq_vp,
                        cap_sa, cap_stm, cap_csm, cap_vp) -> pd.Series:
     """
-    Combine four equity curves into a single portfolio P&L series.
-    Each curve starts at its allocated capital; we convert to P&L delta
-    then sum, starting from total capital.
+    Combine four equity curves.
+    Uses UNION of all date indexes so no data is discarded.
+    Curves that haven't started yet contribute 0 P&L (capital idle).
     """
-    common = eq_sa.index
-    for eq in [eq_stm, eq_csm, eq_vp]:
-        common = common.intersection(eq.index)
+    all_indexes = [eq.index for eq in [eq_sa, eq_stm, eq_csm, eq_vp]
+                   if len(eq) > 0]
+    if not all_indexes:
+        return pd.Series(TOTAL_CAPITAL, name="Portfolio")
 
-    pnl_sa  = eq_sa.reindex(common).ffill()  - cap_sa
-    pnl_stm = eq_stm.reindex(common).ffill() - cap_stm
-    pnl_csm = eq_csm.reindex(common).ffill() - cap_csm
-    pnl_vp  = eq_vp.reindex(common).ffill()  - cap_vp
+    # Union of all dates — no data lost
+    union_idx = all_indexes[0]
+    for idx in all_indexes[1:]:
+        union_idx = union_idx.union(idx)
+    union_idx = union_idx.sort_values()
+
+    pnl_sa  = _safe_pnl(eq_sa,  cap_sa,  union_idx)
+    pnl_stm = _safe_pnl(eq_stm, cap_stm, union_idx)
+    pnl_csm = _safe_pnl(eq_csm, cap_csm, union_idx)
+    pnl_vp  = _safe_pnl(eq_vp,  cap_vp,  union_idx)
 
     portfolio = TOTAL_CAPITAL + pnl_sa + pnl_stm + pnl_csm + pnl_vp
-    return portfolio.rename("Portfolio")
+    return portfolio.rename("Portfolio").dropna()
 
 
 # =============================================================================
@@ -611,12 +658,17 @@ def main():
         spy_eq = spy / spy.iloc[0] * TOTAL_CAPITAL
 
     # ── Stats ────────────────────────────────────────────────────────────────
-    years = (portfolio.index[-1] - portfolio.index[0]).days / 365
-    stats_port = calc_stats(portfolio, TOTAL_CAPITAL, years)
-    stats_sa   = calc_stats(eq_sa,   cap_sa,   years)
-    stats_stm  = calc_stats(eq_stm,  cap_stm,  years) if len(eq_stm) > 10 else {}
-    stats_csm  = calc_stats(eq_csm,  cap_csm,  years) if len(eq_csm) > 10 else {}
-    stats_sp   = calc_stats(spy_eq,  TOTAL_CAPITAL, years) if spy_eq is not None else {}
+    def _years(s):
+        if s is None or len(s) < 2: return 1.0
+        s = s.dropna()
+        return max((s.index[-1] - s.index[0]).days / 365, 0.1)
+
+    stats_port = calc_stats(portfolio, TOTAL_CAPITAL,  _years(portfolio))
+    stats_sa   = calc_stats(eq_sa,     cap_sa,         _years(eq_sa))
+    stats_stm  = calc_stats(eq_stm,    cap_stm,        _years(eq_stm))  if len(eq_stm)>10 else {}
+    stats_csm  = calc_stats(eq_csm,    cap_csm,        _years(eq_csm))  if len(eq_csm)>10 else {}
+    stats_sp   = calc_stats(spy_eq,    TOTAL_CAPITAL,  _years(spy_eq))  if spy_eq is not None else {}
+    years      = _years(portfolio)  # keep for any downstream use
 
     # ── KPI strip ────────────────────────────────────────────────────────────
     k = st.columns(7)
