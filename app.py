@@ -53,46 +53,60 @@ STARTING_CAPITAL = 1000
 # 2. SIZING
 # =============================================================================
 def compute_legs(sig, capital=STARTING_CAPITAL):
-    target_per_leg = capital / 2
-    shares_a = max(1, int(target_per_leg / sig["price_a"]))
-    shares_b = max(1, int(shares_a * sig["beta"]))
+    """
+    Beta-Weighted (Delta-Neutral) sizing.
+    Allocates capital so dollar exposure tracks the hedge ratio beta.
+    qty_a = capital / (price_a + beta * price_b)
+    qty_b = qty_a * beta
+    This means both legs move the same dollar amount per Z-score unit.
+    """
+    price_a = float(sig["price_a"])
+    price_b = float(sig["price_b"])
+    beta    = float(sig["beta"])
 
-    # Unrealised P&L from open_trade entry prices (if available)
-    pnl        = None
-    pnl_a      = None
-    pnl_b      = None
-    entry_pa   = None
-    entry_pb   = None
+    denom    = price_a + (beta * price_b)
+    qty_a    = capital / denom if denom != 0 else 1
+    qty_b    = qty_a * beta
+    shares_a = max(1, round(qty_a))
+    shares_b = max(1, round(qty_b))
+
+    notional_a   = round(shares_a * price_a, 2)
+    notional_b   = round(shares_b * price_b, 2)
+    total_cost   = round(notional_a + notional_b, 2)
+    hedge_ratio  = round(shares_a / shares_b, 2) if shares_b != 0 else 0
+    dollar_imbal = round(abs(notional_a - (notional_b / beta if beta != 0 else notional_b)), 2)
+
+    # Unrealised P&L from entry prices captured by state-machine replay
+    pnl = pnl_a = pnl_b = None
+    entry_pa = entry_pb = None
     ot = sig.get("open_trade")
     if ot and ot.get("entry_price_a") and ot.get("entry_price_b"):
         ep_a     = float(ot["entry_price_a"])
         ep_b     = float(ot["entry_price_b"])
-        cp_a     = float(sig["price_a"])
-        cp_b     = float(sig["price_b"])
         entry_pa = round(ep_a, 2)
         entry_pb = round(ep_b, 2)
         is_long  = ot["direction"] == "LONG"
-        # Long: bought A, sold B. P&L = (curr_a - entry_a)*shares_a - (curr_b - entry_b)*shares_b
-        # Short: sold A, bought B. P&L = (entry_a - curr_a)*shares_a - (entry_b - curr_b)*shares_b
         if is_long:
-            pnl_a = round((cp_a - ep_a) * shares_a, 2)
-            pnl_b = round(-(cp_b - ep_b) * shares_b, 2)
+            pnl_a = round((price_a - ep_a) * shares_a, 2)
+            pnl_b = round(-(price_b - ep_b) * shares_b, 2)
         else:
-            pnl_a = round(-(cp_a - ep_a) * shares_a, 2)
-            pnl_b = round((cp_b - ep_b) * shares_b, 2)
+            pnl_a = round(-(price_a - ep_a) * shares_a, 2)
+            pnl_b = round((price_b - ep_b) * shares_b, 2)
         pnl = round(pnl_a + pnl_b, 2)
 
     return {
-        "shares_a":   shares_a,
-        "shares_b":   shares_b,
-        "notional_a": round(shares_a * sig["price_a"], 2),
-        "notional_b": round(shares_b * sig["price_b"], 2),
-        "total_cost": round((shares_a * sig["price_a"]) + (shares_b * sig["price_b"]), 2),
-        "pnl":        pnl,
-        "pnl_a":      pnl_a,
-        "pnl_b":      pnl_b,
-        "entry_pa":   entry_pa,
-        "entry_pb":   entry_pb,
+        "shares_a":    shares_a,
+        "shares_b":    shares_b,
+        "notional_a":  notional_a,
+        "notional_b":  notional_b,
+        "total_cost":  total_cost,
+        "hedge_ratio": hedge_ratio,
+        "dollar_imbal":dollar_imbal,
+        "pnl":         pnl,
+        "pnl_a":       pnl_a,
+        "pnl_b":       pnl_b,
+        "entry_pa":    entry_pa,
+        "entry_pb":    entry_pb,
     }
 
 
