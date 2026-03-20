@@ -54,27 +54,34 @@ STARTING_CAPITAL = 1000
 # =============================================================================
 def compute_legs(sig, capital=STARTING_CAPITAL):
     """
-    Beta-Weighted (Delta-Neutral) sizing.
-    Allocates capital so dollar exposure tracks the hedge ratio beta.
-    qty_a = capital / (price_a + beta * price_b)
-    qty_b = qty_a * beta
-    This means both legs move the same dollar amount per Z-score unit.
+    Beta-Weighted fractional sizing (0.1 share precision).
+    Mathematical derivation for dollar neutrality:
+      (qty_a * price_a) == (qty_b * price_b) / beta
+      Total capital = (qty_a * price_a) + (qty_b * price_b)
+      => qty_a = capital / (price_a + beta * price_b)
+      => qty_b = qty_a * beta
+    Fractional shares (0.1 precision) minimise the dollar imbalance
+    that integer rounding introduces on high-priced stocks.
     """
     price_a = float(sig["price_a"])
     price_b = float(sig["price_b"])
-    beta    = float(sig["beta"])
+    beta    = abs(float(sig["beta"]))   # abs() — direction handled by sign of trade
 
     denom    = price_a + (beta * price_b)
-    qty_a    = capital / denom if denom != 0 else 1
+    qty_a    = capital / denom if denom != 0 else 0.1
     qty_b    = qty_a * beta
-    shares_a = max(1, round(qty_a))
-    shares_b = max(1, round(qty_b))
+
+    # 0.1-share precision; floor to 0.1 minimum so neither leg is zero
+    shares_a = max(0.1, round(qty_a, 1))
+    shares_b = max(0.1, round(qty_b, 1))
 
     notional_a   = round(shares_a * price_a, 2)
     notional_b   = round(shares_b * price_b, 2)
     total_cost   = round(notional_a + notional_b, 2)
+    # Signed imbalance: positive = leg A heavier, negative = leg B heavier
+    imbalance    = round(notional_a - notional_b, 2)
+    dollar_imbal = round(abs(imbalance), 2)   # kept for card colour logic
     hedge_ratio  = round(shares_a / shares_b, 2) if shares_b != 0 else 0
-    dollar_imbal = round(abs(notional_a - (notional_b / beta if beta != 0 else notional_b)), 2)
 
     # Unrealised P&L from entry prices captured by state-machine replay
     pnl = pnl_a = pnl_b = None
@@ -95,18 +102,20 @@ def compute_legs(sig, capital=STARTING_CAPITAL):
         pnl = round(pnl_a + pnl_b, 2)
 
     return {
-        "shares_a":    shares_a,
-        "shares_b":    shares_b,
-        "notional_a":  notional_a,
-        "notional_b":  notional_b,
-        "total_cost":  total_cost,
-        "hedge_ratio": hedge_ratio,
-        "dollar_imbal":dollar_imbal,
-        "pnl":         pnl,
-        "pnl_a":       pnl_a,
-        "pnl_b":       pnl_b,
-        "entry_pa":    entry_pa,
-        "entry_pb":    entry_pb,
+        "shares_a":      shares_a,
+        "shares_b":      shares_b,
+        "notional_a":    notional_a,
+        "notional_b":    notional_b,
+        "total_cost":    total_cost,       # alias kept for existing card code
+        "total_deployed":total_cost,       # new name from fractional spec
+        "imbalance":     imbalance,        # signed: + means A heavier
+        "dollar_imbal":  dollar_imbal,     # abs value for colour threshold
+        "hedge_ratio":   hedge_ratio,
+        "pnl":           pnl,
+        "pnl_a":         pnl_a,
+        "pnl_b":         pnl_b,
+        "entry_pa":      entry_pa,
+        "entry_pb":      entry_pb,
     }
 
 
@@ -262,7 +271,7 @@ def render_trade_card(sig):
     pct_str     = str(round(pct_clamped, 0)) + "%"
     pa_str      = "$" + str(round(sig["price_a"], 2))
     pb_str      = "$" + str(round(sig["price_b"], 2))
-    sha_str     = str(legs["shares_a"])
+    sha_str     = str(legs["shares_a"])   # already float with 1dp
     shb_str     = str(legs["shares_b"])
     not_a_str   = "$" + "{:,.0f}".format(legs["notional_a"])
     not_b_str   = "$" + "{:,.0f}".format(legs["notional_b"])
@@ -365,13 +374,15 @@ def render_trade_card(sig):
                + ("  entry " + epb_str + "  →  now " + pb_str if epb_str else "  @ " + pb_str)
                + "  =  " + not_b_str,
                leg2_col)
-        + _row("Total Deployed", total_str, "#e8eaf0")
+        + _row("Total Deployed", total_str + "  of $" + str(STARTING_CAPITAL), "#e8eaf0")
         + _row("Hedge Ratio (β-weighted)",
                str(legs["shares_a"]) + ":" + str(legs["shares_b"])
                + "  (β=" + str(round(sig["beta"], 2)) + ")",
                "#e8c96d")
-        + _row("Dollar Imbalance", "$" + str(legs["dollar_imbal"]),
-               "#00d4a0" if legs["dollar_imbal"] < 50 else "#f5a623")
+        + _row("Dollar Imbalance",
+               ("+" if legs["imbalance"] >= 0 else "") + "$" + "{:,.2f}".format(legs["imbalance"])
+               + ("  ✓ neutral" if legs["dollar_imbal"] < 20 else "  ⚠ rebalance"),
+               "#00d4a0" if legs["dollar_imbal"] < 20 else "#f5a623")
         + '</div>'
 
         '<div style="background:rgba(0,0,0,0.25);border-radius:4px;padding:12px 14px;'
