@@ -86,7 +86,25 @@ def get_market_data() -> pd.DataFrame:
     Long TTL (24h) since historical data is stable.
     """
     tickers = list(set(t for p in PAIRS for t in p))
-    df = yf.download(tickers, period="10y", interval="1d")["Close"]
+    raw = yf.download(tickers, period="10y", interval="1d", auto_adjust=True)
+
+    # yfinance returns MultiIndex columns when downloading multiple tickers.
+    # Flatten to a simple ticker-keyed DataFrame regardless of yfinance version.
+    if isinstance(raw.columns, pd.MultiIndex):
+        # MultiIndex: (field, ticker) — grab "Close" level
+        if "Close" in raw.columns.get_level_values(0):
+            df = raw["Close"]
+        elif "Adj Close" in raw.columns.get_level_values(0):
+            df = raw["Adj Close"]
+        else:
+            df = raw.xs(raw.columns.get_level_values(0)[0], axis=1, level=0)
+    else:
+        # Single ticker or already flat
+        df = raw[["Close"]] if "Close" in raw.columns else raw
+
+    # Ensure columns are plain ticker strings, not tuples
+    df.columns = [str(c) for c in df.columns]
+
     return df.ffill().dropna()
 
 
