@@ -1,7 +1,7 @@
 # =============================================================================
-# OMNI-ARB v5.5  |  Statistical Arbitrage Terminal
+# OMNI-ARB v5.6  |  Statistical Arbitrage Terminal
 # State-machine logic: Entry Hysteresis / Toggle Logic
-# Focus: Live Signals & Active Trade Tracking
+# Focus: Execution-Centric Signals (Stocks & Options)
 # =============================================================================
 
 import streamlit as st
@@ -16,7 +16,7 @@ import plotly.graph_objects as go
 # =============================================================================
 # 0. CONFIG & THEME
 # =============================================================================
-st.set_page_config(page_title="Omni-Arb v5.5", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Omni-Arb v5.6", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
     <style>
@@ -24,6 +24,7 @@ st.markdown("""
     .stPlotlyChart { background-color: #0b0e14; border-radius: 10px; }
     [data-testid="stHeader"] { background: rgba(0,0,0,0); }
     h1, h2, h3 { font-family: 'IBM Plex Mono', monospace; letter-spacing: -0.5px; }
+    code { color: #e1e1e1 !important; background: rgba(255,255,255,0.1) !important; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -38,7 +39,7 @@ ROLLING_WINDOW   = 60
 STARTING_CAPITAL = 1000
 
 # =============================================================================
-# 2. SIZING  (live signal cards)
+# 2. SIZING & EXECUTION LOGIC
 # =============================================================================
 def compute_legs(sig, capital=STARTING_CAPITAL):
     target_per_leg = capital / 2
@@ -46,14 +47,12 @@ def compute_legs(sig, capital=STARTING_CAPITAL):
     shares_b = max(1, int(shares_a * sig["beta"]))
     return {
         "shares_a":   shares_a,
-        "notional_a": shares_a * sig["price_a"],
         "shares_b":   shares_b,
-        "notional_b": shares_b * sig["price_b"],
-        "total_cost": shares_a * sig["price_a"] + shares_b * sig["price_b"],
+        "total_cost": (shares_a * sig["price_a"]) + (shares_b * sig["price_b"]),
     }
 
 # =============================================================================
-# 3. DATA ENGINE (Includes State-Machine Replay)
+# 3. DATA ENGINE (State-Machine Processor)
 # =============================================================================
 @st.cache_data(ttl=3600)
 def get_market_data():
@@ -79,38 +78,25 @@ def process_pairs(df_raw):
         z_series = (
             (spread - spread.rolling(ROLLING_WINDOW).mean())
             / spread.rolling(ROLLING_WINDOW).std()
-        )
+        ).dropna()
+        
         curr_z = z_series.iloc[-1]
-
-        long_entries  = z_series[(z_series <= -ENTRY_Z) & (z_series.shift(1) > -ENTRY_Z)]
-        short_entries = z_series[(z_series >= ENTRY_Z)  & (z_series.shift(1) < ENTRY_Z)]
-        exits = z_series[
-            ((z_series >= 0) & (z_series.shift(1) < 0))
-            | ((z_series <= 0) & (z_series.shift(1) > 0))
-        ]
-
         adf_pval = adfuller(spread)[1]
 
-        # ── Open trade detection (state-machine replay) ──────────────────
-        # Walk the full z_series to find if the most recent entry cross
-        # is still unclosed (no zero-cross or stop hit since then).
+        # ── State-Machine Replay (The "Toggle" Logic) ──────────────────
         in_open         = False
         open_direction  = None
-        open_entry_date = None
         open_entry_z    = None
 
         for _i in range(1, len(z_series)):
             _zp = z_series.iloc[_i - 1]
             _zc = z_series.iloc[_i]
-            _dt = z_series.index[_i]
 
             if not in_open:
                 if _zp > -ENTRY_Z and _zc <= -ENTRY_Z:
-                    in_open = True; open_direction = "LONG"
-                    open_entry_date = _dt; open_entry_z = _zc
+                    in_open = True; open_direction = "LONG"; open_entry_z = _zc
                 elif _zp < ENTRY_Z and _zc >= ENTRY_Z:
-                    in_open = True; open_direction = "SHORT"
-                    open_entry_date = _dt; open_entry_z = _zc
+                    in_open = True; open_direction = "SHORT"; open_entry_z = _zc
             else:
                 closed = (
                     (open_direction == "LONG"  and _zp < 0 and _zc >= 0) or
@@ -119,20 +105,13 @@ def process_pairs(df_raw):
                 )
                 if closed:
                     in_open = False; open_direction = None
-                    open_entry_date = None; open_entry_z = None
 
         open_trade = (
-            {"direction": open_direction, "entry_date": open_entry_date,
-             "entry_z": open_entry_z, "curr_z": curr_z}
+            {"direction": open_direction, "entry_z": open_entry_z, "curr_z": curr_z}
             if in_open else None
         )
 
-        # Direction: at-threshold OR currently in an open trade
-        direction_now = (
-            "LONG"    if curr_z <= -ENTRY_Z else
-            "SHORT"   if curr_z >= ENTRY_Z  else
-            (open_direction if open_trade else "NEUTRAL")
-        )
+        direction_now = open_direction if open_trade else "NEUTRAL"
 
         info = {
             "pair":          f"{ticker_a}/{ticker_b}",
@@ -143,11 +122,6 @@ def process_pairs(df_raw):
             "curr_z":        curr_z,
             "beta":          betas.iloc[-1],
             "z_series":      z_series,
-            "spread":        spread,
-            "pair_df":       pair_df,
-            "long_spots":    long_entries,
-            "short_spots":   short_entries,
-            "exit_spots":    exits,
             "is_cointegrated": adf_pval < 0.05,
             "open_trade":    open_trade,
             "direction":     direction_now,
@@ -159,161 +133,136 @@ def process_pairs(df_raw):
 
 
 # =============================================================================
-# 4. UI HELPERS
+# 4. UI COMPONENTS
 # =============================================================================
 def render_trade_card(sig):
     is_long     = sig["direction"] == "LONG"
     accent      = "#00ffcc" if is_long else "#ff4b4b"
     bg          = "rgba(0, 255, 204, 0.05)" if is_long else "rgba(255, 75, 75, 0.05)"
     legs        = compute_legs(sig)
-    leg1_verb   = "BUY"            if is_long else "SELL"
-    leg2_verb   = "SELL"           if is_long else "BUY"
-    leg1_col    = "#00ffcc"        if is_long else "#ff4b4b"
-    leg2_col    = "#ff4b4b"        if is_long else "#00ffcc"
-    action_text = "BUY THE SPREAD" if is_long else "SELL THE SPREAD"
-    state_text  = "Lagging"        if is_long else "Overextended"
-    z_str       = f"{sig['curr_z']:.2f}"
+    
+    # Textual logic for the specific request
+    action_verb = "BUY THE SPREAD" if is_long else "SELL THE SPREAD"
+    leg1_action = "BUY" if is_long else "SELL"
+    leg2_action = "SELL" if is_long else "BUY"
+    state_text  = "is Lagging" if is_long else "is Overextended"
+    
+    # Options strategy mapping
+    opt_strat = "BULL CALL SPREAD / SELL PUTS" if is_long else "BEAR PUT SPREAD / SELL CALLS"
 
     st.markdown(
-        '<div style="background:' + bg + ';border:1px solid ' + accent + ';padding:20px;'
-        'border-radius:8px;margin-bottom:20px;">'
-        '<div style="display:flex;justify-content:space-between;align-items:center;">'
-        '<h2 style="margin:0;color:' + accent + ';font-size:24px;font-family:monospace;">'
-        + sig["a"] + " / " + sig["b"] + "</h2>"
-        '<div style="text-align:right;">'
-        '<span style="font-size:12px;color:#8892a4;">CURRENT Z-SCORE</span><br>'
-        '<b style="font-size:20px;color:' + accent + ';">' + z_str + "</b>"
-        "</div></div>"
-        '<hr style="border:0;border-top:1px solid rgba(255,255,255,0.1);margin:15px 0;">'
-        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">'
-        "<div>"
-        '<p style="font-size:11px;color:#4a5568;margin-bottom:8px;text-transform:uppercase;">Action Required</p>'
-        '<b style="font-size:16px;color:#fff;">' + action_text + "</b><br>"
-        '<span style="font-size:13px;color:#8892a4;">' + sig["a"] + " is " + state_text + "</span>"
-        "</div>"
-        '<div style="background:rgba(0,0,0,0.2);padding:10px;border-radius:4px;">'
-        '<p style="font-size:10px;color:#4a5568;margin:0;">EXECUTION GUIDE ($1K)</p>'
-        '<div style="display:flex;justify-content:space-between;margin-top:5px;font-family:monospace;">'
-        '<span style="color:' + leg1_col + ';">' + leg1_verb + " " + str(legs["shares_a"]) + " " + sig["a"] + "</span>"
-        '<span style="color:' + leg2_col + ';">' + leg2_verb + " " + str(legs["shares_b"]) + " " + sig["b"] + "</span>"
-        "</div></div></div></div>",
-        unsafe_allow_html=True,
+        f"""
+        <div style="background:{bg}; border:1px solid {accent}; padding:20px; border-radius:8px; margin-bottom:20px;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <h2 style="margin:0; color:{accent}; font-family:monospace;">{sig['a']} / {sig['b']}</h2>
+                <div style="text-align:right;">
+                    <span style="font-size:12px; color:#8892a4;">CURRENT Z-SCORE</span><br>
+                    <b style="font-size:20px; color:{accent};">{sig['curr_z']:.2f}</b>
+                </div>
+            </div>
+            
+            <hr style="border:0; border-top:1px solid rgba(255,255,255,0.1); margin:15px 0;">
+            
+            <div style="display:grid; grid-template-columns: 1.2fr 1fr; gap:20px;">
+                <div>
+                    <p style="font-size:11px; color:#4a5568; margin-bottom:4px; text-transform:uppercase;">Action Required</p>
+                    <b style="font-size:18px; color:#fff;">{action_verb}</b><br>
+                    <span style="font-size:14px; color:{accent}; font-weight:bold;">
+                        {leg1_action} {sig['a']} + {leg2_action} {sig['b']}
+                    </span><br>
+                    <span style="font-size:12px; color:#8892a4;">{sig['a']} {state_text} relative to {sig['b']}</span>
+                </div>
+                
+                <div style="background:rgba(0,0,0,0.3); padding:12px; border-radius:4px; border:1px solid rgba(255,255,255,0.05);">
+                    <p style="font-size:10px; color:#8892a4; margin:0 0 8px 0; letter-spacing:1px; font-family:monospace;">EXECUTION GUIDE ($1K CAPITAL)</p>
+                    
+                    <div style="margin-bottom:12px;">
+                        <span style="font-size:10px; color:#4a9eff; font-weight:bold;">OPTION 1 (STOCKS):</span><br>
+                        <code style="font-size:12px; font-family:monospace;">
+                            {leg1_action} {legs['shares_a']} {sig['a']} / {leg2_action} {legs['shares_b']} {sig['b']}
+                        </code>
+                    </div>
+                    
+                    <div>
+                        <span style="font-size:10px; color:#a78bfa; font-weight:bold;">OPTION 2 (DERIVATIVES):</span><br>
+                        <span style="font-size:11px; color:#e1e1e1; font-family:monospace;">{opt_strat} on {sig['a']}</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
     )
 
-
 # =============================================================================
-# 5. MAIN DASHBOARD
+# 5. MAIN TERMINAL
 # =============================================================================
 def main():
-    st.title("📟 Omni-Arb Terminal v5.5")
-    st.caption(
-        f"Asset Universe: S&P 500 Pairs  |  Engine: State-Machine Cointegration  |  "
-        f"Live Capital: ${STARTING_CAPITAL}"
-    )
+    st.title("📟 Omni-Arb Terminal v5.6")
+    st.caption(f"Universe: S&P 500 Pairs | Mode: Live Signal Tracking | Static Capital: ${STARTING_CAPITAL}")
     st.divider()
 
-    with st.spinner("Fetching market data..."):
+    with st.spinner("Syncing with Market Data..."):
         data_raw = get_market_data()
 
     all_pairs, active_pairs = process_pairs(data_raw)
 
-    # ── Active signals ────────────────────────────────────────
+    # ── ACTIVE SIGNALS ────────────────────────────────────────
     if active_pairs:
         st.subheader("⚠️ ACTIVE TRADE SIGNALS")
         for sig in active_pairs:
             render_trade_card(sig)
     else:
-        st.info("✨ No active deviations detected. Monitoring market for entry...")
+        st.info("✨ No active deviations currently maintained by the state-machine.")
 
     st.divider()
 
-    # ── Pair analysis charts ──────────────────────────────────
+    # ── PAIR MONITORING ───────────────────────────────────────
     st.subheader("📊 PAIR ANALYSIS")
     chart_cols = st.columns(2)
 
     for i, p in enumerate(all_pairs):
         with chart_cols[i % 2]:
-            z_data     = p["z_series"].dropna()
+            z_data     = p["z_series"]
             open_trade = p.get("open_trade")
-            is_long    = (open_trade or {}).get("direction") == "LONG"
-            is_short   = (open_trade or {}).get("direction") == "SHORT"
-
-            st.markdown(f"<h4 style='text-align: center; color: #8892a4;'>{p['pair']}</h4>", unsafe_allow_html=True)
+            
+            st.markdown(f"<p style='text-align: center; color: #8892a4; margin-bottom:-10px; font-family:monospace;'>{p['pair']}</p>", unsafe_allow_html=True)
 
             fig = go.Figure()
 
-            # ── Active trade zone shading ─────────────────────
-            # Shades from entry_z toward 0.0 to show remaining profit room
+            # Active Trade Highlight
             if open_trade:
-                entry_z_val  = open_trade["entry_z"]
-                if is_long:
-                    shade_y_lo = min(entry_z_val, EXIT_Z)
-                    shade_y_hi = EXIT_Z
-                else:
-                    shade_y_lo = EXIT_Z
-                    shade_y_hi = max(entry_z_val, EXIT_Z)
-                
-                # Add shaded rectangle for active trade
-                fig.add_hrect(
-                    y0=shade_y_lo, y1=shade_y_hi, 
-                    fillcolor="rgba(0, 255, 204, 0.1)" if is_long else "rgba(255, 75, 75, 0.1)",
-                    layer="below", line_width=0,
-                )
+                color = "rgba(0, 255, 204, 0.1)" if open_trade["direction"] == "LONG" else "rgba(255, 75, 75, 0.1)"
+                fig.add_hrect(y0=open_trade["entry_z"], y1=EXIT_Z, fillcolor=color, line_width=0, layer="below")
+                fig.add_annotation(text="ACTIVE", xref="paper", yref="paper", x=0.5, y=0.9, showarrow=False, 
+                                   font=dict(color="#000"), bgcolor="#00ffcc" if open_trade["direction"] == "LONG" else "#ff4b4b")
 
-                # Add floating "OPEN TRADE" banner to chart
-                banner_color = "#00ffcc" if is_long else "#ff4b4b"
-                fig.add_annotation(
-                    text=f"STATUS: OPEN {open_trade['direction']}",
-                    xref="paper", yref="paper", x=0.5, y=0.95, showarrow=False,
-                    font=dict(size=12, color="#000", family="monospace"),
-                    bgcolor=banner_color, borderpad=4, bordercolor=banner_color
-                )
-
-            # Draw Z-Score Line
-            fig.add_trace(go.Scatter(
-                x=z_data.index, y=z_data, mode='lines', 
-                line=dict(color='#00d1ff', width=1.5), name='Z-Score'
-            ))
-
-            # Threshold Lines
+            fig.add_trace(go.Scatter(x=z_data.index, y=z_data, line=dict(color='#00d1ff', width=1.5)))
             fig.add_hline(y=EXIT_Z, line=dict(color="#ffffff", width=1, dash="dot"))
             fig.add_hline(y=ENTRY_Z, line=dict(color="#ff4b4b", width=1))
             fig.add_hline(y=-ENTRY_Z, line=dict(color="#00ffcc", width=1))
-            fig.add_hline(y=STOP_Z, line=dict(color="#f5a623", width=2, dash="dash"))
-            fig.add_hline(y=-STOP_Z, line=dict(color="#f5a623", width=2, dash="dash"))
 
             fig.update_layout(
-                template="plotly_dark", height=250, margin=dict(l=10, r=10, t=10, b=20),
+                template="plotly_dark", height=240, margin=dict(l=10, r=10, t=20, b=10),
                 paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14", showlegend=False,
-                xaxis=dict(range=[z_data.index[-100], z_data.index[-1] + pd.Timedelta(days=5)], showgrid=False),
+                xaxis=dict(range=[z_data.index[-90], z_data.index[-1]], showgrid=False),
                 yaxis=dict(range=[-4, 4], showgrid=False, zeroline=False)
             )
             st.plotly_chart(fig, use_container_width=True)
 
-    # ── State-machine explainer (Enhanced and moved to main) ───────────────────────────────
+    # ── STATE-MACHINE LOGIC EXPLAINER ─────────────────────────
     st.divider()
     st.markdown(
-        '<div style="background:#111318;border:1px solid rgba(255,255,255,0.07);'
-        'border-left:3px solid #4a9eff;border-radius:4px;padding:20px;">'
-        '<h3 style="margin:0 0 15px;font-family:monospace;font-size:16px;color:#4a9eff;'
-        'text-transform:uppercase;letter-spacing:0.1em;">Engine Methodology: The State-Machine</h3>'
-        '<p style="color:#8892a4; font-size:13px; margin-bottom: 20px;">'
-        'This terminal operates on strict <b>Entry Hysteresis (Toggle) Logic</b>. This acts like a physical circuit breaker to protect your capital from market noise and over-trading.</p>'
-        '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:20px;">'
-        '<div><p style="margin:0 0 8px;font-size:14px;color:#00ffcc;font-family:monospace;">① The Entry Phase</p>'
-        '<p style="margin:0;font-size:13px;color:#e1e1e1;line-height:1.6;">'
-        'Z crosses ±2.25. Position opens. Switch flips <b>ON</b>. '
-        'All subsequent re-crosses are completely ignored. There is no double-down, and no averaging-in.</p></div>'
-        '<div><p style="margin:0 0 8px;font-size:14px;color:#f5a623;font-family:monospace;">② The Noise Phase</p>'
-        '<p style="margin:0;font-size:13px;color:#e1e1e1;line-height:1.6;">'
-        'The Z-score wiggles above and below the threshold line. The system does nothing. '
-        'Your capital is protected from whip-sawing. Opportunity cost: your allocated cash is locked until the exit triggers.</p></div>'
-        '<div><p style="margin:0 0 8px;font-size:14px;color:#ffffff;font-family:monospace;">③ The Exit Phase</p>'
-        '<p style="margin:0;font-size:13px;color:#e1e1e1;line-height:1.6;">'
-        'Z returns to exactly 0.0. Both legs automatically close, P&L is realized, and the switch resets to <b>NEUTRAL</b>. '
-        'A hard stop-loss at ±3.5 cuts losses early if the spread structurally breaks down.</p></div>'
-        "</div></div>",
-        unsafe_allow_html=True,
+        """
+        <div style="background:#111318; border-radius:4px; padding:20px; border-left:4px solid #4a9eff;">
+            <p style="font-family:monospace; font-size:14px; color:#4a9eff; margin-bottom:10px;">ENGINE LOGIC: STATE-MACHINE HYSTERESIS</p>
+            <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:20px; font-size:12px; color:#8892a4;">
+                <div><b style="color:#eee;">1. Entry Toggle</b><br>Cross ±2.25 flips the 'ON' switch. Re-crosses are ignored to prevent over-trading.</div>
+                <div><b style="color:#eee;">2. Noise Phase</b><br>Capital stays locked while Z-score vibrates. This avoids unnecessary fees and slippage.</div>
+                <div><b style="color:#eee;">3. Reset Trigger</b><br>Positions exit ONLY at 0.0 or ±3.5 (Stop). Only then does the 'ON' switch reset to Neutral.</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True
     )
 
 if __name__ == "__main__":
