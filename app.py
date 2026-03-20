@@ -98,23 +98,48 @@ def compute_legs(sig, capital=STARTING_CAPITAL):
     hedge_ratio    = round(shares_a / shares_b, 2) if shares_b != 0 else 0
     ratio_str      = str(shares_a) + ":" + str(shares_b)
 
-    # Step 4 — unrealised P&L from entry prices (state-machine replay)
+    # Step 4 — spread P&L using entry-LOCKED shares (Medallion method)
+    # Use locked shares from entry so sizing drift does not corrupt P&L.
+    # Spread P&L = log(cp_a/ep_a) * notional_a  -  beta * log(cp_b/ep_b) * notional_b
+    # This correctly measures whether the RELATIVE move (not absolute) favours us.
     pnl = pnl_a = pnl_b = None
     entry_pa = entry_pb = None
+    pnl_potential = None   # remaining profit if trade closes at 0.0
     ot = sig.get("open_trade")
     if ot and ot.get("entry_price_a") and ot.get("entry_price_b"):
+        import math as _math
         ep_a     = float(ot["entry_price_a"])
         ep_b     = float(ot["entry_price_b"])
         entry_pa = round(ep_a, 2)
         entry_pb = round(ep_b, 2)
         is_long  = ot["direction"] == "LONG"
+        # Use entry-locked shares if available, else fall back to current sizing
+        _sa = float(ot["entry_shares_a"]) if ot.get("entry_shares_a") else shares_a
+        _sb = float(ot["entry_shares_b"]) if ot.get("entry_shares_b") else shares_b
+        # Dollar P&L per leg (simple, for leg breakdown display)
         if is_long:
-            pnl_a = round((price_a - ep_a) * shares_a, 2)
-            pnl_b = round(-(price_b - ep_b) * shares_b, 2)
+            pnl_a = round((price_a - ep_a) * _sa, 2)
+            pnl_b = round(-(price_b - ep_b) * _sb, 2)
         else:
-            pnl_a = round(-(price_a - ep_a) * shares_a, 2)
-            pnl_b = round((price_b - ep_b) * shares_b, 2)
+            pnl_a = round(-(price_a - ep_a) * _sa, 2)
+            pnl_b = round((price_b - ep_b) * _sb, 2)
         pnl = round(pnl_a + pnl_b, 2)
+        # Spread P&L = log-return of spread × notional_a
+        # Positive when spread reverts toward 0 (regardless of market direction)
+        notional_a_entry = _sa * ep_a
+        log_spread_entry = _math.log(ep_a) - beta * _math.log(ep_b)
+        log_spread_now   = _math.log(price_a) - beta * _math.log(price_b)
+        delta_spread     = log_spread_now - log_spread_entry
+        spread_pnl = round(
+            (delta_spread * notional_a_entry) * (1 if is_long else -1), 2
+        )
+        # Remaining profit potential (if spread closes all the way to 0)
+        entry_z_val  = float(ot.get("entry_z") or 0)
+        curr_z_val   = float(sig["curr_z"])
+        if entry_z_val != 0:
+            pnl_per_z_unit = spread_pnl / max(abs(abs(entry_z_val) - abs(curr_z_val)), 0.01)
+            pnl_potential  = round(pnl_per_z_unit * abs(curr_z_val), 2)
+        pnl = spread_pnl   # override with spread-correct P&L
 
     return {
         # Core sizing
@@ -135,6 +160,7 @@ def compute_legs(sig, capital=STARTING_CAPITAL):
         "pnl":            pnl,
         "pnl_a":          pnl_a,
         "pnl_b":          pnl_b,
+        "pnl_potential":  pnl_potential,   # remaining profit if closed at 0
         # Entry prices for P&L calculation
         "entry_pa":       entry_pa,
         "entry_pb":       entry_pb,
@@ -221,6 +247,16 @@ def process_pairs(df_raw):
                 (abs(open_entry_z) - abs(curr_z)) / abs(open_entry_z) * 100, 1
             )
 
+        # Compute entry-locked shares using Medallion formula at entry prices
+        if in_open and open_entry_pa and open_entry_pb:
+            _beta_abs    = max(abs(float(betas.iloc[-1])), 0.01)
+            _d_a         = STARTING_CAPITAL / (1.0 + _beta_abs)
+            _d_b         = STARTING_CAPITAL - _d_a
+            _entry_sa    = max(0.1, round(_d_a / float(open_entry_pa), 1))
+            _entry_sb    = max(0.1, round(_d_b / float(open_entry_pb), 1))
+        else:
+            _entry_sa = _entry_sb = None
+
         open_trade = (
             {
                 "direction":    open_direction,
@@ -230,6 +266,8 @@ def process_pairs(df_raw):
                 "pct_to_target": pct_to_target,
                 "entry_price_a": open_entry_pa,
                 "entry_price_b": open_entry_pb,
+                "entry_shares_a": _entry_sa,   # LOCKED at entry
+                "entry_shares_b": _entry_sb,   # LOCKED at entry
             }
             if in_open else None
         )
@@ -321,17 +359,31 @@ def render_trade_card(sig):
         pnl_bg    = "rgba(0,212,160,0.10)" if pnl_val >= 0 else "rgba(245,101,101,0.10)"
         pnl_border= "rgba(0,212,160,0.30)" if pnl_val >= 0 else "rgba(245,101,101,0.30)"
         pnl_label = "UNREALISED P&L"
+        pnl_pot     = legs.get("pnl_potential")
+        pot_str     = ("  |  remaining: +" + "${:,.0f}".format(pnl_pot) if pnl_pot and pnl_pot > 0 else "")
         pnl_badge = (
-            '<div style="display:inline-flex;align-items:center;gap:10px;'
-            'background:' + pnl_bg + ';border:1px solid ' + pnl_border + ';'
-            'border-radius:4px;padding:6px 14px;margin-bottom:14px;">'
-            '<span style="font-size:9px;color:#4a5568;font-family:monospace;'
-            'text-transform:uppercase;letter-spacing:0.1em;">' + pnl_label + '</span>'
-            '<span style="font-family:monospace;font-size:20px;font-weight:600;color:' + pnl_color + ';">'
+            '<div style="background:' + pnl_bg + ';border:1px solid ' + pnl_border + ';'
+            'border-radius:4px;padding:10px 14px;margin-bottom:14px;">'
+            '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">'
+            '<div>'
+            '<p style="margin:0 0 2px;font-size:9px;color:#4a5568;font-family:monospace;'
+            'text-transform:uppercase;letter-spacing:0.1em;">Spread P&L (Unrealised)</p>'
+            '<span style="font-family:monospace;font-size:24px;font-weight:600;color:' + pnl_color + ';">'
             + pnl_sign + "${:,.0f}".format(pnl_val) + '</span>'
-            '<span style="font-size:10px;color:#4a5568;font-family:monospace;">'
-            'Leg A: ' + fmt_pnl(pnl_a_val) + '  Leg B: ' + fmt_pnl(pnl_b_val)
-            + '</span>'
+            + ('<span style="font-family:monospace;font-size:12px;color:#00d4a0;margin-left:8px;">'
+               + pot_str + '</span>' if pot_str else "")
+            + '</div>'
+            '<div style="border-left:1px solid rgba(255,255,255,0.08);padding-left:12px;">'
+            '<p style="margin:0 0 3px;font-size:9px;color:#4a5568;font-family:monospace;'
+            'text-transform:uppercase;letter-spacing:0.1em;">Leg Breakdown</p>'
+            '<p style="margin:0;font-size:11px;font-family:monospace;">'
+            + sig["a"] + ': ' + fmt_pnl(pnl_a_val)
+            + '  &nbsp; ' + sig["b"] + ': ' + fmt_pnl(pnl_b_val)
+            + '</p>'
+            '<p style="margin:4px 0 0;font-size:10px;color:#4a5568;font-family:monospace;">'
+            'Measured as log-spread return × notional (beta-weighted)</p>'
+            '</div>'
+            '</div>'
             '</div>'
         )
     # ── Action label: context-aware based on Z progress ────────────
