@@ -334,8 +334,6 @@ def render_trade_card(sig):
             + '</span>'
             '</div>'
         )
-    dir_label   = action_label  # dynamic: context-aware action text
-
     # ── Action label: context-aware based on Z progress ────────────
     abs_z = abs(float(sig["curr_z"]))
     if abs_z >= ENTRY_Z:
@@ -344,6 +342,8 @@ def render_trade_card(sig):
         action_label = "HOLD — Spread Narrowing, Approaching Target"
     else:
         action_label = "PREPARE TO EXIT — Z-Score Approaching 0.0"
+    dir_label = action_label
+
 
     # ── Analyst note ─────────────────────────────────────────────────
     risk_ok    = abs(legs["risk_imbalance"]) < 20
