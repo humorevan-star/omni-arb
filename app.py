@@ -1,5 +1,5 @@
 # =============================================================================
-# OMNI-ARB v5.7  |  Statistical Arbitrage Terminal
+# OMNI-ARB v6.0  |  Statistical Arbitrage Terminal
 # State-machine logic: Entry Hysteresis / Toggle Logic
 # Focus: Execution-Centric Signals (Stocks & Options)
 # Enhanced: Rich UX, clear explanations, active-trade zone charts
@@ -19,7 +19,7 @@ from datetime import datetime
 # 0. CONFIG & THEME
 # =============================================================================
 st.set_page_config(
-    page_title="Omni-Arb v5.7",
+    page_title="Omni-Arb v6.0",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -334,12 +334,51 @@ def render_trade_card(sig):
             + '</span>'
             '</div>'
         )
-    dir_label   = ("LONG  — Buy the Spread" if is_long else "SHORT  — Sell the Spread")
-    opt_type    = "Bull Call Spread" if is_long else "Bear Put Spread"
-    opt_action  = "Buy Call + Sell Call (higher strike)" if is_long else "Buy Put + Sell Put (lower strike)"
-    opt_logic   = (
-        sig["a"] + " expected to rise back to fair value." if is_long
-        else sig["a"] + " expected to fall back to fair value."
+    dir_label   = action_label  # dynamic: context-aware action text
+
+    # ── Action label: context-aware based on Z progress ────────────
+    abs_z = abs(float(sig["curr_z"]))
+    if abs_z >= ENTRY_Z:
+        action_label = ("BUY THE SPREAD — " + sig["a"] + " is Lagging") if is_long else ("SELL THE SPREAD — " + sig["a"] + " is Overextended")
+    elif abs_z >= 1.0:
+        action_label = "HOLD — Spread Narrowing, Approaching Target"
+    else:
+        action_label = "PREPARE TO EXIT — Z-Score Approaching 0.0"
+
+    # ── Analyst note ─────────────────────────────────────────────────
+    risk_ok    = abs(legs["risk_imbalance"]) < 20
+    ratio_disp = legs["ratio"]
+    ri_str     = ("+" if legs["risk_imbalance"] >= 0 else "") + "${:,.2f}".format(legs["risk_imbalance"])
+    if is_long:
+        spread_move = "narrowing ✓" if float(sig["curr_z"]) > float(ot.get("entry_z", sig["curr_z"])) else "still diverging"
+        note_body = (
+            "Spread is " + spread_move + ". Using ratio " + ratio_disp + " corrects the Price-Beta Trap — "
+            + sig["b"] + " is no longer overpowering the trade. "
+            + ("Risk imbalance " + ri_str + " is optimized. " if risk_ok else "Monitor risk imbalance " + ri_str + ". ")
+            + "Exit when Z-Score hits 0.0."
+        )
+    else:
+        spread_move = "narrowing ✓" if float(sig["curr_z"]) < float(ot.get("entry_z", sig["curr_z"])) else "still diverging"
+        note_body = (
+            "Spread is " + spread_move + ". Using ratio " + ratio_disp + " neutralizes the Zuckerberg Risk — "
+            "selling fewer shares of the higher-priced " + sig["b"] + " keeps both legs dollar-balanced. "
+            + ("Risk imbalance " + ri_str + " is optimized. " if risk_ok else "Monitor risk imbalance " + ri_str + ". ")
+            + "Exit when Z-Score hits 0.0."
+        )
+    market_hedge = (
+        "If the S&P 500 moves ±500pts, your " + sig["a"] + " move will be offset by " + sig["b"] + ". "
+        "Your only alpha source is the Z-Score returning to 0."
+    )
+    analyst_note = (
+        '<p style="margin:0 0 8px;font-size:11px;color:#e8eaf0;line-height:1.65;">' + note_body + '</p>'
+        '<p style="margin:0 0 8px;font-size:11px;color:#8892a4;line-height:1.65;">' + market_hedge + '</p>'
+        '<div style="display:flex;align-items:center;gap:8px;margin-top:10px;padding-top:8px;'
+        'border-top:1px solid rgba(255,255,255,0.05);">'
+        '<span style="font-size:9px;color:#f5a623;font-family:monospace;">⛔ STOP</span>'
+        '<span style="font-size:10px;color:#4a5568;font-family:monospace;">Hard exit if |Z| hits ±' + str(STOP_Z) + '</span>'
+        '<span style="font-size:9px;color:#00d4a0;font-family:monospace;margin-left:12px;">🎯 TARGET</span>'
+        '<span style="font-size:10px;color:#4a5568;font-family:monospace;">Close both legs when Z = 0.0</span>'
+        '</div>'
     )
 
     progress_bar = (
@@ -378,13 +417,12 @@ def render_trade_card(sig):
         + progress_bar +
         '</div>'
 
-        + pnl_badge
         + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">'
 
         '<div style="background:rgba(0,0,0,0.25);border-radius:4px;padding:12px 14px;'
         'border:1px solid rgba(255,255,255,0.05);">'
         '<p style="margin:0 0 8px;font-size:10px;color:#4a9eff;font-family:monospace;'
-        'text-transform:uppercase;letter-spacing:0.1em;">Option 1 — Stocks (Beta-Weighted)</p>'
+        'text-transform:uppercase;letter-spacing:0.1em;">Execution — Fractional Shares (Medallion)</p>'
         + (pnl_badge if has_pnl else '')
         + _row(leg1_action + "  " + sig["a"],
                sha_str + " shs"
@@ -412,15 +450,10 @@ def render_trade_card(sig):
 
         '<div style="background:rgba(0,0,0,0.25);border-radius:4px;padding:12px 14px;'
         'border:1px solid rgba(255,255,255,0.05);">'
-        '<p style="margin:0 0 8px;font-size:10px;color:#a78bfa;font-family:monospace;'
-        'text-transform:uppercase;letter-spacing:0.1em;">Option 2 — Options Equivalent</p>'
-        + _row("Strategy", opt_type, "#a78bfa")
-        + _row("Structure", opt_action, "#e8eaf0")
-        + '<div style="margin-top:8px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.05);">'
-        '<p style="margin:0 0 4px;font-size:11px;color:#8892a4;line-height:1.5;">' + opt_logic + '</p>'
-        '<p style="margin:0;font-size:11px;color:#f5a623;">Max loss capped at stop ±' + str(STOP_Z) + '</p>'
-        '</div>'
-        '</div>'
+        '<p style="margin:0 0 10px;font-size:10px;color:#a78bfa;font-family:monospace;'
+        'text-transform:uppercase;letter-spacing:0.1em;">Analyst Note</p>'
+        + analyst_note
+        + '</div>'
 
         '</div></div>'
     )
@@ -680,12 +713,58 @@ def render_engine_explainer():
 
 
 # =============================================================================
+# 9b. WATCHLIST PANEL  (neutral pairs)
+# =============================================================================
+def render_watchlist(neutral_pairs: list):
+    if not neutral_pairs:
+        return
+    st.markdown(
+        '<p style="font-family:monospace;font-size:10px;letter-spacing:0.12em;'
+        'color:#4a5568;text-transform:uppercase;margin:0 0 10px;">Pair Watchlist — Neutral Zone</p>',
+        unsafe_allow_html=True,
+    )
+    cols = st.columns(len(neutral_pairs))
+    for i, p in enumerate(neutral_pairs):
+        z    = float(p["curr_z"])
+        dist = round(abs(abs(z) - ENTRY_Z), 2)
+        z_color  = "#4a9eff" if z > 0 else "#00ffcc"
+        coint_col= "#00d4a0" if p["is_cointegrated"] else "#f5a623"
+        coint_lbl= "Cointegrated" if p["is_cointegrated"] else "Drifting"
+        if z > 0:
+            wait_msg = "Wait for +" + str(ENTRY_Z) + " to Short"
+        elif abs(z) < 0.3:
+            wait_msg = "Dormant — near zero"
+        else:
+            wait_msg = "Wait for -" + str(ENTRY_Z) + " to Buy"
+        bar_pct = min(abs(z) / ENTRY_Z * 100, 100)
+        bar_col = z_color
+        cols[i].markdown(
+            '<div style="background:#111318;border:1px solid rgba(255,255,255,0.07);'
+            'border-radius:4px;padding:12px 14px;">'
+            '<p style="margin:0 0 2px;font-family:monospace;font-size:13px;'
+            'font-weight:500;color:#e8eaf0;">' + p["a"] + ' <span style="color:#2d3748;">/</span> ' + p["b"] + '</p>'
+            '<p style="margin:0 0 8px;font-size:10px;color:#4a5568;font-family:monospace;">' + wait_msg + '</p>'
+            '<div style="display:flex;align-items:baseline;gap:6px;margin-bottom:6px;">'
+            '<span style="font-family:monospace;font-size:22px;font-weight:600;color:' + z_color + ';">' + str(round(z,2)) + '</span>'
+            '<span style="font-size:10px;color:#4a5568;font-family:monospace;">/ ±' + str(ENTRY_Z) + '</span>'
+            '</div>'
+            '<div style="height:3px;background:rgba(255,255,255,0.07);border-radius:2px;margin-bottom:8px;">'
+            '<div style="width:' + str(round(bar_pct,1)) + '%;height:100%;background:' + bar_col + ';'
+            'border-radius:2px;"></div></div>'
+            '<span style="font-size:9px;color:' + coint_col + ';'
+            'font-family:monospace;">' + coint_lbl + '  ·  ' + str(dist) + 'σ from entry</span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+
+# =============================================================================
 # 10. MAIN TERMINAL
 # =============================================================================
 def main():
     col_title, col_meta = st.columns([3, 1])
     with col_title:
-        st.title("Omni-Arb Terminal v5.7")
+        st.title("Omni-Arb Terminal v6.0")
         st.caption(
             "Universe: S&P 500 Sector Pairs  |  Engine: State-Machine Cointegration  |  "
             "Capital: $" + str(STARTING_CAPITAL) + " per signal  |  "
@@ -743,6 +822,12 @@ def main():
         )
 
     st.divider()
+
+    # Watchlist: neutral pairs
+    neutral_pairs = [p for p in all_pairs if p["direction"] == "NEUTRAL"]
+    if neutral_pairs:
+        render_watchlist(neutral_pairs)
+        st.markdown("<br>", unsafe_allow_html=True)
 
     st.markdown(
         '<div style="display:flex;align-items:baseline;gap:12px;margin-bottom:8px;">'
