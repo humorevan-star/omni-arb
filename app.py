@@ -253,6 +253,7 @@ def render_trade_card(sig):
     not_a_str   = "$" + "{:,.0f}".format(legs["notional_a"])
     not_b_str   = "$" + "{:,.0f}".format(legs["notional_b"])
     total_str   = "$" + "{:,.0f}".format(legs["total_cost"])
+    hedge_str   = str(legs["shares_a"]) + ":" + str(legs["shares_b"])
 
     # Entry prices & P&L strings
     epa_str     = "$" + str(round(legs["entry_pa"], 2)) if legs["entry_pa"] else None
@@ -338,7 +339,7 @@ def render_trade_card(sig):
         '<div style="background:rgba(0,0,0,0.25);border-radius:4px;padding:12px 14px;'
         'border:1px solid rgba(255,255,255,0.05);">'
         '<p style="margin:0 0 8px;font-size:10px;color:#4a9eff;font-family:monospace;'
-        'text-transform:uppercase;letter-spacing:0.1em;">Option 1 — Stock Execution</p>'
+        'text-transform:uppercase;letter-spacing:0.1em;">Option 1 — Stocks (Beta-Weighted)</p>'
         + (pnl_badge if has_pnl else '')
         + _row(leg1_action + "  " + sig["a"],
                sha_str + " shs"
@@ -350,7 +351,13 @@ def render_trade_card(sig):
                + ("  entry " + epb_str + "  →  now " + pb_str if epb_str else "  @ " + pb_str)
                + "  =  " + not_b_str,
                leg2_col)
-        + _row("Total Capital Used", total_str, "#e8eaf0")
+        + _row("Total Deployed", total_str, "#e8eaf0")
+        + _row("Hedge Ratio (β-weighted)",
+               str(legs["shares_a"]) + ":" + str(legs["shares_b"])
+               + "  (β=" + str(round(sig["beta"], 2)) + ")",
+               "#e8c96d")
+        + _row("Dollar Imbalance", "$" + str(legs["dollar_imbal"]),
+               "#00d4a0" if legs["dollar_imbal"] < 50 else "#f5a623")
         + '</div>'
 
         '<div style="background:rgba(0,0,0,0.25);border-radius:4px;padding:12px 14px;'
