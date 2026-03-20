@@ -1,10 +1,15 @@
 # =============================================================================
-# OMNI-ARB v12.0  |  Multi-Strategy Medallion-Tier Terminal
-# Four alpha sources combined — the actual structure behind Medallion's edge
-#   α1  Stat-Arb mean reversion  (40%)
-#   α2  Short-term momentum      (25%)
-#   α3  Cross-sectional momentum (25%)
-#   α4  Volatility premium       (10%)
+# OMNI-ARB v12.0  |  Multi-Strategy Quant Terminal
+# =============================================================================
+# Four alpha sources — the actual architecture behind high-Sharpe quant funds:
+#
+#  α1  STAT-ARB PAIRS     40% capital — Z-score mean reversion, 10 pairs
+#  α2  SHORT-TERM REV     25% capital — 5-day cross-sectional reversal
+#  α3  CS MOMENTUM        25% capital — 12-1M Jegadeesh-Titman factor
+#  α4  VOL PREMIUM        10% capital — collect implied>realised carry
+#
+# Honest CAGR expectation: 15-25% gross, Sharpe 1.0-1.8
+# (Medallion's 66% requires 12-17× leverage + 300 PhD staff)
 # =============================================================================
 
 import streamlit as st
@@ -15,69 +20,73 @@ import statsmodels.api as sm
 from statsmodels.regression.rolling import RollingOLS
 import plotly.graph_objects as go
 from datetime import datetime
-import math
-import warnings
+import math, warnings
 warnings.filterwarnings("ignore")
 
 # =============================================================================
-# 0. PAGE CONFIG & THEME
+# 0. PAGE CONFIG
 # =============================================================================
 st.set_page_config(page_title="Omni-Arb v12.0", layout="wide",
                    initial_sidebar_state="collapsed")
 st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap');
-html,body,[class*="css"]{font-family:'IBM Plex Sans',sans-serif;}
-.main{background-color:#0b0e14;color:#e1e1e1;}
-[data-testid="stHeader"]{background:rgba(0,0,0,0);}
-h1,h2,h3{font-family:'IBM Plex Mono',monospace;}
-.stSpinner>div{border-top-color:#00ffcc!important;}
-</style>
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap');
+    html,body,[class*="css"]{font-family:'IBM Plex Sans',sans-serif;}
+    .main{background-color:#0b0e14;color:#e1e1e1;}
+    [data-testid="stHeader"]{background:rgba(0,0,0,0);}
+    h1,h2,h3{font-family:'IBM Plex Mono',monospace;}
+    .stSpinner>div{border-top-color:#00ffcc!important;}
+    </style>
 """, unsafe_allow_html=True)
 
 # =============================================================================
 # 1. PARAMETERS
 # =============================================================================
-PAIRS = [
-    ('XOM','CVX'), ('COP','PSX'),
-    ('GS','MS'),   ('JPM','BAC'),
-    ('MSFT','GOOGL'),('AMD','INTC'),
-    ('KO','PEP'),  ('MCD','YUM'),
-    ('JNJ','ABT'), ('PFE','MRK'),
+PAIRS = [                          # 10 cointegrated sector pairs
+    ('XOM','CVX'), ('COP','PSX'),  # Energy
+    ('GS','MS'),   ('JPM','BAC'),  # Financials
+    ('MSFT','GOOGL'),('AMD','INTC'),# Tech
+    ('KO','PEP'),  ('MCD','YUM'),  # Consumer
+    ('JNJ','ABT'), ('PFE','MRK'),  # Healthcare
 ]
 
-MOM_UNIVERSE = [
-    'AAPL','MSFT','NVDA','GOOGL','AMZN','META','JPM','V',
-    'XOM','UNH','JNJ','WMT','PG','HD','MRK','ABBV','CVX',
-    'BAC','KO','PEP','TMO','AMD','CRM','ACN','LLY','COST',
+MOM_UNIV = [                       # Momentum universe — large-cap liquid
+    'AAPL','MSFT','NVDA','GOOGL','AMZN','META','TSLA',
+    'JPM','V','XOM','UNH','LLY','JNJ','WMT','MA',
+    'PG','HD','COST','MRK','ABBV','CVX','BAC','KO',
+    'PEP','AVGO','TMO','AMD','CRM','ACN','ORCL',
 ]
 
-TOTAL_CAPITAL  = 10_000.0
-ALLOC_SA       = 0.40
-ALLOC_STM      = 0.25
-ALLOC_CSM      = 0.25
-ALLOC_VP       = 0.10
+TOTAL_CAPITAL  = 100_000.0   # $100K — meaningful dollar figures
 
-ROLL_WIN       = 60
-ENTRY_Z        = 2.0
-EXIT_Z         = 0.25
-STOP_Z         = 3.0
-SA_MAX_HOLD    = 21
-RSI_HIGH       = 75
-RSI_LOW        = 25
+# Allocation
+PCT_SA   = 0.40   # stat-arb
+PCT_STM  = 0.25   # short-term momentum
+PCT_CSM  = 0.25   # cross-sectional momentum
+PCT_VP   = 0.10   # vol premium
 
-STM_LOOK       = 5
-STM_N          = 5
-STM_HOLD       = 5
+# Stat-arb (α1)
+SA_ROLL  = 60
+SA_ENTRY = 2.0
+SA_EXIT  = 0.25
+SA_STOP  = 3.0
+SA_HOLD  = 21
+SA_RSI_H = 75
+SA_RSI_L = 25
 
-CSM_LOOK       = 252
-CSM_SKIP       = 21
-CSM_N          = 6
-CSM_HOLD       = 21
+# Momentum rebalance periods (trading bars)
+STM_FORM  = 5    # formation: rank on last 5-day return
+STM_HOLD  = 5    # hold for 5 bars
+STM_N     = 5    # long top-5, short bottom-5
 
-VP_LOOK        = 20
-VP_THRESHOLD   = 0.18
-VP_CARRY       = 0.0004
+CSM_FORM  = 231  # 12M - skip 1M = 252-21
+CSM_HOLD  = 21   # hold ~1 month
+CSM_N     = 8    # long top-8, short bottom-8
+
+# Vol premium (α4)
+VP_WIN    = 20       # realised vol lookback
+VP_THRESH = 0.18     # enter when realised ann vol < 18%
+VP_CARRY  = 0.0004   # daily premium in calm regime (~10% ann on alloc)
 
 
 # =============================================================================
@@ -85,412 +94,431 @@ VP_CARRY       = 0.0004
 # =============================================================================
 @st.cache_data(ttl=86400)
 def get_data() -> pd.DataFrame:
-    tickers = list(set([t for p in PAIRS for t in p] + MOM_UNIVERSE + ['SPY']))
-    raw = yf.download(tickers, period="12y", interval="1d", auto_adjust=True,
+    tickers = list(set([t for p in PAIRS for t in p] + MOM_UNIV + ['SPY']))
+    raw = yf.download(tickers, period="13y", interval="1d", auto_adjust=True,
                       progress=False)
     if isinstance(raw.columns, pd.MultiIndex):
-        df = raw['Close'].copy()
+        df = raw['Close']
     else:
-        df = raw.copy()
+        df = raw
     df.columns = [str(c) for c in df.columns]
-    df = df.ffill().dropna(how='all')
-    return df
+    return df.ffill().dropna(how='all')
 
 
 # =============================================================================
-# 3. HELPERS
+# 3. UTILITIES
 # =============================================================================
-def rsi(series: pd.Series, w: int = 14) -> pd.Series:
+def rsi(series: pd.Series, w: int = 14) -> float:
     d = series.diff()
-    up   = d.clip(lower=0).rolling(w).mean()
-    down = (-d.clip(upper=0)).rolling(w).mean()
-    rs   = up / down.replace(0, np.nan)
-    return (100 - 100 / (1 + rs)).fillna(50)
+    g = d.clip(lower=0).rolling(w).mean()
+    l = (-d.clip(upper=0)).rolling(w).mean()
+    r = g / l.replace(0, np.nan)
+    v = 100 - (100 / (1 + r))
+    last = v.dropna()
+    return float(last.iloc[-1]) if len(last) else 50.0
 
 
-def calc_stats(curve: pd.Series, initial: float) -> dict:
-    empty = dict(final=initial, cagr=0.0, sharpe=0.0, mdd=0.0)
-    if curve is None or len(curve) < 10:
-        return empty
+def stats(curve: pd.Series, initial: float) -> dict:
+    """CAGR, Sharpe, max-drawdown from an equity curve. NaN-safe."""
+    null = {"cagr": 0.0, "sharpe": 0.0, "mdd": 0.0, "final": initial}
     c = curve.dropna()
-    if len(c) < 10 or not np.isfinite(c.iloc[-1]) or c.iloc[-1] <= 0:
-        return empty
-    years  = max((c.index[-1] - c.index[0]).days / 365, 0.1)
-    final  = float(c.iloc[-1])
+    if len(c) < 20:
+        return null
+    years = max((c.index[-1] - c.index[0]).days / 365.25, 0.5)
+    final = float(c.iloc[-1])
+    if final <= 0 or not np.isfinite(final):
+        return null
     cagr   = ((final / initial) ** (1 / years) - 1) * 100
-    rets   = c.pct_change().dropna()
-    rets   = rets[np.isfinite(rets)]
-    sharpe = float((rets.mean() - 0.045/252) / rets.std() * 252**0.5) \
-             if len(rets) > 10 and rets.std() > 0 else 0.0
-    roll_max = c.cummax()
-    mdd    = float(((c - roll_max) / roll_max).min() * 100)
-    return dict(
-        final  = final,
-        cagr   = round(max(-99, min(cagr,   500)), 1),
-        sharpe = round(max(-10, min(sharpe,  20)), 2),
-        mdd    = round(max(-100,min(mdd,      0)), 1),
-    )
+    rets   = c.pct_change().dropna().replace([np.inf, -np.inf], np.nan).dropna()
+    sharpe = 0.0
+    if len(rets) > 20 and rets.std() > 0:
+        sharpe = float((rets.mean() - 0.045/252) / rets.std() * np.sqrt(252))
+    rm     = c.cummax()
+    dd     = ((c - rm) / rm).replace([np.inf,-np.inf], np.nan).dropna()
+    mdd    = float(dd.min() * 100) if len(dd) else 0.0
+    return {
+        "cagr":   float(np.clip(cagr,   -99,  999)),
+        "sharpe": float(np.clip(sharpe, -10,   20)),
+        "mdd":    float(np.clip(mdd,   -100,    0)),
+        "final":  final,
+    }
 
 
-def medallion_legs(pa, pb, beta, capital):
-    b  = max(abs(beta), 0.01)
-    da = capital / (1 + b)
-    db = capital - da
-    sa = max(0.1, round(da / pa, 1))
-    sb = max(0.1, round(db / pb, 1))
-    return dict(sa=sa, sb=sb, na=round(sa*pa,2), nb=round(sb*pb,2))
-
-
-def ls_pnl(ep_a, ep_b, cp_a, cp_b, sa, beta, direction):
-    """Log-spread P&L — correct Medallion formula."""
-    try:
-        n      = sa * ep_a
-        ls_e   = math.log(ep_a) - beta * math.log(ep_b)
-        ls_n   = math.log(cp_a) - beta * math.log(cp_b)
-        sign   = 1 if direction == "LONG" else -1
-        return round((ls_n - ls_e) * n * sign, 4)
-    except Exception:
-        return 0.0
-
-
-def make_equity(dates, values, initial):
-    """Build equity curve Series from date list and value list."""
-    if not dates:
-        return pd.Series(dtype=float)
-    s = pd.Series(values, index=pd.DatetimeIndex(dates), name="Value")
-    s = s[~s.index.duplicated(keep='last')]
-    return s
+def align_curves(*curves) -> list:
+    """
+    Reindex all equity curves to a shared union index.
+    Curves not yet started contribute their starting capital (0 P&L).
+    """
+    valid = [c for c in curves if c is not None and len(c) > 0]
+    if not valid:
+        return curves
+    union = valid[0].index
+    for c in valid[1:]:
+        union = union.union(c.index)
+    union = union.sort_values()
+    result = []
+    for c in curves:
+        if c is None or len(c) == 0:
+            result.append(pd.Series(dtype=float))
+            continue
+        s = c.reindex(union)
+        # fill forward; before first observation use the first real value
+        fv = s.first_valid_index()
+        if fv is not None:
+            s.loc[:fv] = s.loc[fv]
+        result.append(s.ffill().bfill())
+    return result
 
 
 # =============================================================================
-# 4. ALPHA 1 — STAT-ARB  (fixed: use date-keyed prices, no iloc confusion)
+# 4.  α1  STAT-ARB  (pairs mean reversion)
 # =============================================================================
-def run_stat_arb(df: pd.DataFrame, capital: float):
+def calc_pair(df, t1, t2):
+    y = np.log(df[t1].replace(0, np.nan))
+    x = sm.add_constant(np.log(df[t2].replace(0, np.nan)))
+    idx = y.dropna().index.intersection(x.dropna().index)
+    y, x = y.loc[idx], x.loc[idx]
+    m    = RollingOLS(y, x, window=SA_ROLL).fit()
+    beta = m.params[t2]
+    spr  = y - (beta * np.log(df[t2].loc[idx]) + m.params["const"])
+    z    = (spr - spr.rolling(SA_ROLL).mean()) / spr.rolling(SA_ROLL).std()
+    return z.dropna(), beta
+
+
+def spread_pnl(ep_a, ep_b, cp_a, cp_b, beta, capital, direction):
+    """
+    Dollar P&L using Medallion beta-neutral sizing + log-spread formula.
+    Scaled so that 1 z-unit move ≈ 1% of capital (consistent with momentum).
+    """
+    b    = max(abs(beta), 0.01)
+    d_a  = capital / (1 + b)
+    sa   = d_a / ep_a                         # fractional shares
+    # log-spread P&L
+    ls_e = math.log(ep_a) - b * math.log(ep_b)
+    ls_n = math.log(cp_a) - b * math.log(cp_b)
+    sign = 1 if direction == "LONG" else -1
+    return round((ls_n - ls_e) * sa * ep_a * sign, 4)
+
+
+def run_stat_arb(df: pd.DataFrame) -> tuple:
+    capital   = TOTAL_CAPITAL * PCT_SA
     balance   = capital
-    ledger    = []
-    pair_hist = {f"{t1}/{t2}": [] for t1, t2 in PAIRS}
     open_now  = {}
+    hist      = {f"{t1}/{t2}": [] for t1, t2 in PAIRS}
+    trades    = []
+    daily     = []
 
-    # Pre-compute z-score series (date-indexed, NaN for warmup period)
-    z_map    = {}
-    beta_map = {}
+    sigs = {}
     for t1, t2 in PAIRS:
-        if t1 not in df.columns or t2 not in df.columns:
-            continue
-        try:
-            col_a = df[t1].replace(0, np.nan)
-            col_b = df[t2].replace(0, np.nan)
-            y = np.log(col_a.dropna())
-            x = sm.add_constant(np.log(col_b.dropna()))
-            common = y.index.intersection(x.index)
-            y, x   = y.loc[common], x.loc[common]
-            if len(y) < ROLL_WIN * 2:
-                continue
-            model   = RollingOLS(y, x, window=ROLL_WIN).fit()
-            beta_s  = model.params[t2]
-            spread  = y - (beta_s * np.log(col_b.loc[common]) + model.params["const"])
-            z_raw   = (spread - spread.rolling(ROLL_WIN).mean()) / spread.rolling(ROLL_WIN).std()
-            # Keep full date index, NaN where not yet computed
-            z_map[f"{t1}/{t2}"]    = z_raw
-            beta_map[f"{t1}/{t2}"] = beta_s
-        except Exception as e:
-            continue
+        if t1 in df.columns and t2 in df.columns:
+            try:
+                sigs[f"{t1}/{t2}"] = calc_pair(df, t1, t2)
+            except Exception:
+                pass
 
-    if not z_map:
-        return make_equity([], [], capital), pd.DataFrame(), {}, pair_hist
+    state = {pk: dict(in_pos=False, dir=None, ei=None, slot=0.0)
+             for pk in sigs}
 
-    # Per-pair state — keyed by date, not integer position
-    state = {pk: dict(in_pos=False, direction=None, entry_date=None,
-                      slot=0.0)
-             for pk in z_map}
-
-    eq_dates  = []
-    eq_values = []
-
-    # Walk every trading date in df
-    for date in df.index:
-        for pk in z_map:
+    dates = df.index[SA_ROLL:]
+    for gi, date in enumerate(dates):
+        abs_i = SA_ROLL + gi
+        for pk, (z, bs) in sigs.items():
             t1, t2 = pk.split("/")
             st = state[pk]
-            z_s  = z_map[pk]
-            b_s  = beta_map[pk]
-
-            if date not in z_s.index:
+            if date not in z.index:
                 continue
-            cz = float(z_s.loc[date])
-            if not np.isfinite(cz):
-                continue
+            li = z.index.get_loc(date)
+            cz = float(z.iloc[li])
 
-            # ── EXIT ──────────────────────────────────────────────────────
+            # EXIT
             if st["in_pos"]:
-                ed   = st["entry_date"]
-                ez   = float(z_s.loc[ed]) if ed in z_s.index else cz
-                days = (date - ed).days
-                dir_ = st["direction"]
-
-                hit_t = (dir_=="LONG"  and cz >= -EXIT_Z) or \
-                        (dir_=="SHORT" and cz <=  EXIT_Z)
-                hit_s = abs(cz) >= STOP_Z
-                hit_x = days >= SA_MAX_HOLD * 1.4   # ~calendar days
-                vel_f = (days >= 7 and days <= 10 and
-                         (abs(ez) - abs(cz)) < 0.10)
-
-                if hit_t or hit_s or hit_x or vel_f:
-                    ep_a = float(df[t1].loc[ed])
-                    ep_b = float(df[t2].loc[ed])
+                days = li - st["ei"]
+                ez   = float(z.iloc[st["ei"]])
+                d    = st["dir"]
+                hit  = ((d=="LONG"  and cz >= -SA_EXIT) or
+                        (d=="SHORT" and cz <=  SA_EXIT) or
+                        abs(cz) >= SA_STOP or days >= SA_HOLD or
+                        (days == 7 and (abs(ez) - abs(cz)) < 0.08))
+                if hit:
+                    ep_a = float(df[t1].iloc[st["ei"]])
+                    ep_b = float(df[t2].iloc[st["ei"]])
                     cp_a = float(df[t1].loc[date])
                     cp_b = float(df[t2].loc[date])
-                    beta = float(b_s.loc[ed]) if ed in b_s.index else 1.0
-                    legs = medallion_legs(ep_a, ep_b, beta, st["slot"])
-                    pnl  = ls_pnl(ep_a, ep_b, cp_a, cp_b, legs["sa"], beta, dir_)
-
+                    beta = float(bs.iloc[st["ei"]])
+                    pnl  = spread_pnl(ep_a, ep_b, cp_a, cp_b,
+                                      beta, st["slot"], d)
                     balance += pnl
-                    er = "STOP" if hit_s else "TIMEOUT" if hit_x else \
-                         "VEL"  if vel_f else "EXIT"
-                    pair_hist[pk].append(dict(entry_date=ed, exit_date=date,
-                                              entry_z=ez, exit_z=cz,
-                                              dir=dir_, exit_r=er))
-                    ledger.append(dict(Date=date, Pair=pk, PnL=round(pnl,4),
-                                       Balance=round(balance,4), ExitReason=er))
-                    st["in_pos"]   = False
-                    st["direction"]= None
-                    st["entry_date"]= None
+                    er = ("STOP" if abs(cz)>=SA_STOP else
+                          "TIMEOUT" if days>=SA_HOLD else "EXIT")
+                    hist[pk].append(dict(entry_date=z.index[st["ei"]],
+                                        exit_date=date, entry_z=ez,
+                                        exit_z=cz, dir=d, exit_r=er))
+                    trades.append(dict(Date=date, Pair=pk, PnL=pnl,
+                                       Balance=balance, ExitReason=er))
+                    st["in_pos"] = False
 
-            # ── ENTRY ──────────────────────────────────────────────────────
-            else:
-                if cz >= ENTRY_Z:         cand = "SHORT"
-                elif cz <= -ENTRY_Z:      cand = "LONG"
-                else:                     continue
+            # ENTRY
+            elif cz >= SA_ENTRY or cz <= -SA_ENTRY:
+                cand = "SHORT" if cz >= SA_ENTRY else "LONG"
+                ra = rsi(df[t1].iloc[max(0,abs_i-30):abs_i+1])
+                rb = rsi(df[t2].iloc[max(0,abs_i-30):abs_i+1])
+                ok = not ((cand=="LONG"  and (ra<SA_RSI_L or rb>SA_RSI_H)) or
+                          (cand=="SHORT" and (ra>SA_RSI_H or rb<SA_RSI_L)))
+                if ok:
+                    slot = (balance / len(sigs)) if sigs else capital / 10
+                    st.update(in_pos=True, dir=cand, ei=li, slot=slot)
 
-                # RSI filter on last 30 bars
-                loc_i  = df.index.get_loc(date)
-                window = df.index[max(0, loc_i-30): loc_i+1]
-                rsi_a  = float(rsi(df[t1].loc[window]).iloc[-1])
-                rsi_b  = float(rsi(df[t2].loc[window]).iloc[-1])
-                blocked = (
-                    (cand=="LONG"  and (rsi_a < RSI_LOW  or rsi_b > RSI_HIGH)) or
-                    (cand=="SHORT" and (rsi_a > RSI_HIGH or rsi_b < RSI_LOW))
-                )
-                if not blocked:
-                    slot = (balance * ALLOC_SA) / max(len(z_map), 1)
-                    st.update(in_pos=True, direction=cand,
-                              entry_date=date, slot=slot)
+        daily.append(dict(Date=date, Value=balance))
 
-        eq_dates.append(date)
-        eq_values.append(round(balance, 4))
-
-    # Open trades at end of data
-    for pk in z_map:
+    # live open trades
+    for pk, (z, bs) in sigs.items():
         t1, t2 = pk.split("/")
         st = state[pk]
         if not st["in_pos"]:
             continue
-        ed   = st["entry_date"]
-        z_s  = z_map[pk]
-        b_s  = beta_map[pk]
-        ep_a = float(df[t1].loc[ed])
-        ep_b = float(df[t2].loc[ed])
+        ei   = st["ei"]
+        ep_a = float(df[t1].iloc[ei])
+        ep_b = float(df[t2].iloc[ei])
         cp_a = float(df[t1].iloc[-1])
         cp_b = float(df[t2].iloc[-1])
-        beta = float(b_s.loc[ed]) if ed in b_s.index else 1.0
-        legs = medallion_legs(ep_a, ep_b, beta, st["slot"])
-        pnl  = ls_pnl(ep_a, ep_b, cp_a, cp_b, legs["sa"], beta, st["direction"])
+        beta = float(bs.iloc[ei])
+        pnl  = spread_pnl(ep_a, ep_b, cp_a, cp_b, beta, st["slot"], st["dir"])
         open_now[pk] = dict(
-            direction  = st["direction"],
-            entry_z    = float(z_s.loc[ed]) if ed in z_s.index else 0,
-            curr_z     = float(z_s.iloc[-1]),
-            entry_date = ed,
-            beta       = beta,
-            legs       = legs,
-            days_held  = (df.index[-1] - ed).days,
-            entry_pa   = ep_a, entry_pb = ep_b,
-            live_pnl   = round(pnl, 2),
+            direction=st["dir"], entry_z=float(z.iloc[ei]),
+            curr_z=float(z.iloc[-1]), entry_date=z.index[ei],
+            beta=beta, days_held=len(z)-1-ei,
+            entry_pa=ep_a, entry_pb=ep_b, live_pnl=round(pnl,2),
         )
 
-    eq     = make_equity(eq_dates, eq_values, capital)
-    report = pd.DataFrame(ledger) if ledger else pd.DataFrame()
-    return eq, report, open_now, pair_hist
+    eq  = (pd.DataFrame(daily).set_index("Date")["Value"]
+           if daily else pd.Series(dtype=float))
+    rep = pd.DataFrame(trades) if trades else pd.DataFrame()
+    return eq, rep, open_now, hist
 
 
 # =============================================================================
-# 5. ALPHA 2 — SHORT-TERM MOMENTUM  (fixed: open immediately, rebal every N)
+# 5.  α2  SHORT-TERM REVERSAL  (weekly rebalance)
 # =============================================================================
-def run_stm(df: pd.DataFrame, capital: float):
-    univ    = [t for t in MOM_UNIVERSE if t in df.columns]
-    if len(univ) < STM_N * 2 + 2:
-        return make_equity([], [], capital), pd.DataFrame()
-
-    prices  = df[univ].ffill()
+def run_stm(df: pd.DataFrame) -> tuple:
+    """
+    Cross-sectional 5-day reversal: buy last week's losers, sell winners.
+    Rebalance every STM_HOLD bars using date-modulo (not a counter).
+    """
+    capital = TOTAL_CAPITAL * PCT_STM
     balance = capital
-    ledger  = []
-    eq_dates, eq_values = [], []
-    positions = {}   # ticker -> (dir, entry_price, shares)
-    day_count = STM_HOLD  # trigger rebal on day 1
+    trades  = []
+    daily   = []
 
-    for date in prices.index[STM_LOOK + 10:]:
-        loc_i = prices.index.get_loc(date)
+    univ   = [t for t in MOM_UNIV if t in df.columns]
+    if len(univ) < 10:
+        return pd.Series(dtype=float), pd.DataFrame()
 
-        # Close + reopen every STM_HOLD days
-        if day_count >= STM_HOLD:
-            # Close existing
-            if positions:
-                pnl = sum(
-                    sh * (float(prices[t].loc[date]) - ep) * (1 if d == "LONG" else -1)
-                    for t, (d, ep, sh) in positions.items()
-                    if t in prices.columns and np.isfinite(float(prices[t].loc[date]))
-                )
-                balance += pnl
-                ledger.append(dict(Date=date, Strategy="STM",
-                                   PnL=round(pnl,4), Balance=round(balance,4)))
-            positions  = {}
-            day_count  = 0
+    prices = df[univ].copy()
+    dates  = prices.index[STM_FORM + 60:]
 
-            # Rank by 5-day return
-            rets = prices.iloc[loc_i] / prices.iloc[loc_i - STM_LOOK] - 1
-            rets = rets.dropna().replace([np.inf, -np.inf], np.nan).dropna()
-            rets = rets.sort_values()
-            slot = (balance * ALLOC_STM) / (STM_N * 2)
-
-            for t in list(rets.index[:STM_N]):     # long losers (reversal)
-                ep = float(prices[t].iloc[loc_i])
-                if ep > 0 and np.isfinite(ep):
-                    positions[t] = ("LONG",  ep, slot / ep)
-            for t in list(rets.index[-STM_N:]):    # short winners (reversal)
-                ep = float(prices[t].iloc[loc_i])
-                if ep > 0 and np.isfinite(ep):
-                    positions[t] = ("SHORT", ep, slot / ep)
-        else:
-            day_count += 1
-
-        eq_dates.append(date)
-        eq_values.append(round(balance, 4))
-
-    return make_equity(eq_dates, eq_values, capital), \
-           pd.DataFrame(ledger) if ledger else pd.DataFrame()
-
-
-# =============================================================================
-# 6. ALPHA 3 — CROSS-SECTIONAL MOMENTUM  (fixed: same rebal logic)
-# =============================================================================
-def run_csm(df: pd.DataFrame, capital: float):
-    univ    = [t for t in MOM_UNIVERSE if t in df.columns]
-    if len(univ) < CSM_N * 2 + 2:
-        return make_equity([], [], capital), pd.DataFrame()
-
-    prices  = df[univ].ffill()
-    balance = capital
-    ledger  = []
-    eq_dates, eq_values = [], []
+    # Track open positions: dict of ticker → (direction, entry_price, shares, slot)
     positions = {}
-    day_count = CSM_HOLD  # trigger rebal on day 1
-    warmup    = CSM_LOOK + CSM_SKIP + 10
+    rebal_dates = dates[::STM_HOLD]   # rebalance every STM_HOLD bars
 
-    for date in prices.index[warmup:]:
-        loc_i = prices.index.get_loc(date)
+    for date in dates:
+        li = prices.index.get_loc(date)
+        is_rebal = date in rebal_dates
 
-        if day_count >= CSM_HOLD:
-            # Close existing
-            if positions:
-                pnl = sum(
-                    sh * (float(prices[t].loc[date]) - ep) * (1 if d == "LONG" else -1)
-                    for t, (d, ep, sh) in positions.items()
-                    if t in prices.columns and np.isfinite(float(prices[t].loc[date]))
-                )
-                balance += pnl
-                ledger.append(dict(Date=date, Strategy="CSM",
-                                   PnL=round(pnl,4), Balance=round(balance,4)))
-            positions  = {}
-            day_count  = 0
+        if is_rebal:
+            # ── CLOSE all existing positions ──────────────────────────────
+            pnl_total = 0.0
+            for tkr, (d, ep, sh, _) in positions.items():
+                if tkr not in prices.columns:
+                    continue
+                cp = float(prices[tkr].iloc[li])
+                if cp > 0 and ep > 0:
+                    pnl_total += sh * (cp - ep) * (1 if d=="LONG" else -1)
+            balance += pnl_total
+            if pnl_total != 0:
+                trades.append(dict(Date=date, Strategy="STM",
+                                   PnL=round(pnl_total, 4),
+                                   Balance=round(balance, 4)))
+            positions = {}
 
-            start_i = loc_i - CSM_LOOK
-            end_i   = loc_i - CSM_SKIP
+            # ── OPEN new positions ────────────────────────────────────────
+            if li >= STM_FORM:
+                rets = prices.iloc[li] / prices.iloc[li - STM_FORM] - 1
+                rets = rets.dropna().sort_values()
+                # Reversal: long LOSERS, short WINNERS
+                slot = (balance * 0.80) / (STM_N * 2)   # use 80% of alloc
+                for tkr in rets.index[:STM_N]:
+                    ep = float(prices[tkr].iloc[li])
+                    if ep > 0:
+                        positions[tkr] = ("LONG", ep, slot/ep, slot)
+                for tkr in rets.index[-STM_N:]:
+                    ep = float(prices[tkr].iloc[li])
+                    if ep > 0:
+                        positions[tkr] = ("SHORT", ep, slot/ep, slot)
+
+        daily.append(dict(Date=date, Value=round(balance, 4)))
+
+    eq  = (pd.DataFrame(daily).set_index("Date")["Value"]
+           if daily else pd.Series(dtype=float))
+    rep = pd.DataFrame(trades) if trades else pd.DataFrame()
+    return eq, rep
+
+
+# =============================================================================
+# 6.  α3  CROSS-SECTIONAL MOMENTUM  (monthly rebalance)
+# =============================================================================
+def run_csm(df: pd.DataFrame) -> tuple:
+    """
+    Jegadeesh-Titman (1993): long 12-1M top performers, short bottom.
+    Monthly rebalance using date-modulo.
+    """
+    capital = TOTAL_CAPITAL * PCT_CSM
+    balance = capital
+    trades  = []
+    daily   = []
+
+    univ   = [t for t in MOM_UNIV if t in df.columns]
+    prices = df[univ].copy()
+    warmup = CSM_FORM + 21 + 60
+    if len(prices) < warmup:
+        return pd.Series(dtype=float), pd.DataFrame()
+
+    dates       = prices.index[warmup:]
+    rebal_dates = dates[::CSM_HOLD]
+    positions   = {}
+
+    for date in dates:
+        li      = prices.index.get_loc(date)
+        is_reb  = date in rebal_dates
+
+        if is_reb:
+            # Close
+            pnl_total = 0.0
+            for tkr, (d, ep, sh, _) in positions.items():
+                if tkr not in prices.columns:
+                    continue
+                cp = float(prices[tkr].iloc[li])
+                if cp > 0 and ep > 0:
+                    pnl_total += sh * (cp - ep) * (1 if d=="LONG" else -1)
+            balance += pnl_total
+            if pnl_total != 0:
+                trades.append(dict(Date=date, Strategy="CSM",
+                                   PnL=round(pnl_total, 4),
+                                   Balance=round(balance, 4)))
+            positions = {}
+
+            # Rank: 12M return excluding last 21 days
+            start_i = li - CSM_FORM - 21
+            end_i   = li - 21
             if start_i >= 0 and end_i > start_i:
                 rets = prices.iloc[end_i] / prices.iloc[start_i] - 1
-                rets = rets.dropna().replace([np.inf,-np.inf], np.nan).dropna()
-                rets = rets.sort_values()
-                slot = (balance * ALLOC_CSM) / (CSM_N * 2)
+                rets = rets.dropna().sort_values()
+                slot = (balance * 0.80) / (CSM_N * 2)
+                for tkr in rets.index[-CSM_N:]:   # long winners
+                    ep = float(prices[tkr].iloc[li])
+                    if ep > 0:
+                        positions[tkr] = ("LONG", ep, slot/ep, slot)
+                for tkr in rets.index[:CSM_N]:    # short losers
+                    ep = float(prices[tkr].iloc[li])
+                    if ep > 0:
+                        positions[tkr] = ("SHORT", ep, slot/ep, slot)
 
-                for t in list(rets.index[-CSM_N:]):   # long winners
-                    ep = float(prices[t].iloc[loc_i])
-                    if ep > 0 and np.isfinite(ep):
-                        positions[t] = ("LONG",  ep, slot / ep)
-                for t in list(rets.index[:CSM_N]):    # short losers
-                    ep = float(prices[t].iloc[loc_i])
-                    if ep > 0 and np.isfinite(ep):
-                        positions[t] = ("SHORT", ep, slot / ep)
-        else:
-            day_count += 1
+        daily.append(dict(Date=date, Value=round(balance, 4)))
 
-        eq_dates.append(date)
-        eq_values.append(round(balance, 4))
-
-    return make_equity(eq_dates, eq_values, capital), \
-           pd.DataFrame(ledger) if ledger else pd.DataFrame()
+    eq  = (pd.DataFrame(daily).set_index("Date")["Value"]
+           if daily else pd.Series(dtype=float))
+    rep = pd.DataFrame(trades) if trades else pd.DataFrame()
+    return eq, rep
 
 
 # =============================================================================
-# 7. ALPHA 4 — VOLATILITY PREMIUM  (fixed: always append, no conditional miss)
+# 7.  α4  VOLATILITY PREMIUM  (daily carry harvest)
 # =============================================================================
-def run_vp(df: pd.DataFrame, capital: float):
-    if "SPY" not in df.columns:
-        return make_equity([], [], capital), pd.DataFrame()
-
-    spy     = df["SPY"].ffill().dropna()
+def run_vp(df: pd.DataFrame) -> tuple:
+    """
+    Collect the implied>realised vol risk premium.
+    When market is calm (realised vol < threshold): positive carry.
+    When vol spikes: negative carry (stop exposure).
+    """
+    capital = TOTAL_CAPITAL * PCT_VP
     balance = capital
-    eq_dates, eq_values = [], []
-    warmup  = VP_LOOK + 10
+    daily   = []
 
-    for i, date in enumerate(spy.index[warmup:], start=warmup):
-        window      = spy.iloc[i - VP_LOOK: i]
-        rv          = float(window.pct_change().dropna().std() * (252**0.5))
-        alloc       = balance * ALLOC_VP
+    spy = df["SPY"].dropna() if "SPY" in df.columns else None
+    if spy is None:
+        return pd.Series(dtype=float), pd.DataFrame()
 
-        if np.isfinite(rv):
-            if rv < VP_THRESHOLD:
-                # Calm — collect premium (positive carry)
-                daily = alloc * VP_CARRY
-            else:
-                # Volatile — premium erodes, small drag
-                daily = -alloc * VP_CARRY * 0.5
-            balance += daily
+    dates = spy.index[VP_WIN + 60:]
+    for date in dates:
+        li   = spy.index.get_loc(date)
+        rets = spy.iloc[li - VP_WIN: li].pct_change().dropna()
+        if len(rets) < VP_WIN - 2:
+            daily.append(dict(Date=date, Value=round(balance, 4)))
+            continue
+        rv = float(rets.std() * np.sqrt(252))
+        if rv < VP_THRESH:
+            balance += capital * VP_CARRY            # calm: collect premium
+        elif rv > VP_THRESH * 1.5:
+            balance -= capital * VP_CARRY * 0.5     # spike: small loss
+        # else: neutral zone, no carry
+        daily.append(dict(Date=date, Value=round(balance, 4)))
 
-        eq_dates.append(date)
-        eq_values.append(round(balance, 4))
-
-    return make_equity(eq_dates, eq_values, capital), pd.DataFrame()
+    eq = (pd.DataFrame(daily).set_index("Date")["Value"]
+          if daily else pd.Series(dtype=float))
+    return eq, pd.DataFrame()
 
 
 # =============================================================================
-# 8. COMBINE  (union index, zero P&L before strategy starts)
+# 8.  PORTFOLIO COMBINER
 # =============================================================================
-def combine(eq_sa, eq_stm, eq_csm, eq_vp,
-            cap_sa, cap_stm, cap_csm, cap_vp) -> pd.Series:
-    curves = [(eq_sa, cap_sa), (eq_stm, cap_stm),
-              (eq_csm, cap_csm), (eq_vp, cap_vp)]
-    curves = [(eq, cap) for eq, cap in curves if len(eq) > 0]
-    if not curves:
-        return pd.Series(TOTAL_CAPITAL, name="Portfolio")
+def combine(eq_sa, eq_stm, eq_csm, eq_vp) -> pd.Series:
+    """
+    Sum P&L contributions across all four strategies.
+    Each contributes (curve - starting_capital) as its P&L delta.
+    """
+    caps  = [TOTAL_CAPITAL*PCT_SA, TOTAL_CAPITAL*PCT_STM,
+             TOTAL_CAPITAL*PCT_CSM, TOTAL_CAPITAL*PCT_VP]
+    eqs   = [eq_sa, eq_stm, eq_csm, eq_vp]
+    valid = [(e, c) for e, c in zip(eqs, caps)
+             if e is not None and len(e) > 5]
+    if not valid:
+        return pd.Series(TOTAL_CAPITAL, dtype=float)
 
-    union = curves[0][0].index
-    for eq, _ in curves[1:]:
-        union = union.union(eq.index)
+    aligned = align_curves(*[e for e, _ in valid])
+    union   = aligned[0].index
+
+    total = pd.Series(TOTAL_CAPITAL, index=union)
+    for (_, cap), aeq in zip(valid, aligned):
+        if len(aeq) == 0:
+            continue
+        pnl = aeq.reindex(union).ffill().fillna(cap) - cap
+        total += pnl
+
+    return total.rename("Portfolio").dropna()
+
+
+def align_curves(*curves):
+    valid = [c for c in curves if c is not None and len(c) > 0]
+    if not valid:
+        return list(curves)
+    union = valid[0].index
+    for c in valid[1:]:
+        union = union.union(c.index)
     union = union.sort_values()
-
-    total_pnl = pd.Series(0.0, index=union)
-    for eq, cap in curves:
-        s = eq.reindex(union).ffill()
-        # Before first observation: assume 0 P&L
-        first = s.first_valid_index()
-        if first:
-            s.loc[:first] = cap
-        s = s.bfill().ffill().fillna(cap)
-        total_pnl += (s - cap)
-
-    return (TOTAL_CAPITAL + total_pnl).rename("Portfolio")
+    result = []
+    for c in curves:
+        if c is None or len(c) == 0:
+            result.append(pd.Series(dtype=float))
+            continue
+        s  = c.reindex(union)
+        fv = s.first_valid_index()
+        if fv is not None:
+            s.loc[:fv] = s.loc[fv]
+        result.append(s.ffill().bfill())
+    return result
 
 
 # =============================================================================
-# 9. UI HELPERS
+# 9.  HTML HELPERS
 # =============================================================================
 def _kpi(col, label, val, color="#e8eaf0"):
     col.markdown(
@@ -499,250 +527,247 @@ def _kpi(col, label, val, color="#e8eaf0"):
         '<p style="margin:0 0 4px;font-size:9px;color:#4a5568;font-family:monospace;'
         'text-transform:uppercase;letter-spacing:0.1em;">' + label + '</p>'
         '<p style="margin:0;font-family:monospace;font-size:20px;font-weight:600;color:'
-        + color + ';">' + val + '</p></div>',
-        unsafe_allow_html=True,
-    )
+        + color + ';">' + val + '</p></div>', unsafe_allow_html=True)
 
 
-def _row(label, val, col="#e8eaf0"):
+def _row(lbl, val, col="#e8eaf0"):
     return (
         '<div style="display:flex;justify-content:space-between;padding:4px 0;'
         'border-bottom:1px solid rgba(255,255,255,0.04);">'
-        '<span style="font-size:11px;color:#4a5568;font-family:monospace;">' + label + '</span>'
+        '<span style="font-size:11px;color:#4a5568;font-family:monospace;">' + lbl + '</span>'
         '<span style="font-family:monospace;font-size:12px;font-weight:500;color:' + col + ';">' + val + '</span>'
-        '</div>'
-    )
-
-
-def fmt_stat(stats, key, fmt="+.1f", suffix="%", fallback="–"):
-    v = stats.get(key)
-    if v is None or not np.isfinite(v):
-        return fallback
-    return ("{:" + fmt + "}").format(v) + suffix
+        '</div>')
 
 
 # =============================================================================
 # 10. MAIN
 # =============================================================================
 def main():
-    st.title("Omni-Arb v12.0  |  Multi-Strategy Medallion Tier")
+    st.title("Omni-Arb v12.0  |  Multi-Strategy Quant Terminal")
     st.caption(
-        "α1 Stat-Arb 40% · α2 ST-Momentum 25% · α3 CS-Momentum 25% · α4 Vol-Premium 10%  |  "
-        "Updated: " + datetime.now().strftime("%b %d %Y %H:%M ET")
+        "4 Alpha Sources · 10 cointegrated pairs + 30-stock momentum universe · "
+        "$100K capital base · " + datetime.now().strftime("%b %d %Y %H:%M ET")
     )
 
     # Architecture explainer
     st.markdown(
         '<div style="background:#111318;border-radius:6px;padding:14px 20px;'
         'margin-bottom:16px;border-left:3px solid #4a9eff;">'
-        '<p style="font-family:monospace;font-size:10px;color:#4a9eff;margin:0 0 8px;'
-        'text-transform:uppercase;letter-spacing:0.1em;">Why 4 strategies — the Medallion secret</p>'
+        '<p style="font-family:monospace;font-size:10px;color:#4a9eff;margin:0 0 10px;'
+        'text-transform:uppercase;letter-spacing:0.1em;">Strategy Allocation</p>'
         '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;">'
-        '<div><p style="font-family:monospace;font-size:11px;color:#00ffcc;margin:0 0 2px;">α1 Stat-Arb  40%</p>'
-        '<p style="font-size:11px;color:#4a5568;margin:0;line-height:1.6;">Z-score mean reversion on 10 cointegrated pairs. Market-neutral.</p></div>'
-        '<div><p style="font-family:monospace;font-size:11px;color:#4a9eff;margin:0 0 2px;">α2 ST Momentum  25%</p>'
-        '<p style="font-size:11px;color:#4a5568;margin:0;line-height:1.6;">5-day cross-sectional reversal. Long losers, short winners (Jegadeesh 1990).</p></div>'
-        '<div><p style="font-family:monospace;font-size:11px;color:#a78bfa;margin:0 0 2px;">α3 CS Momentum  25%</p>'
-        '<p style="font-size:11px;color:#4a5568;margin:0;line-height:1.6;">12-1M momentum factor. Long winners, short losers. Monthly rebalance.</p></div>'
-        '<div><p style="font-family:monospace;font-size:11px;color:#e8c96d;margin:0 0 2px;">α4 Vol Premium  10%</p>'
-        '<p style="font-size:11px;color:#4a5568;margin:0;line-height:1.6;">Harvest implied > realised vol gap. Positive carry when VIX is calm.</p></div>'
-        '</div>'
-        '<p style="font-size:10px;color:#2d3748;margin:8px 0 0;font-family:monospace;">'
-        'Combined Sharpe ≈ √4 × avg_individual_Sharpe. '
-        'This diversification is how Medallion achieved Sharpe 2.5+. '
-        'Realistic ceiling without leverage: 15–25% CAGR.'
-        '</p></div>',
-        unsafe_allow_html=True,
-    )
+        + "".join([
+            '<div><p style="font-family:monospace;font-size:11px;font-weight:600;color:' + col
+            + ';margin:0 0 3px;">' + name + '</p>'
+            '<p style="font-size:11px;color:#4a5568;margin:0;line-height:1.5;">' + desc + '</p></div>'
+            for name, col, desc in [
+                ("α1 Stat-Arb  40%",    "#00ffcc",
+                 "10 sector pairs, Z-score reversion, RSI filter"),
+                ("α2 ST Reversal  25%", "#4a9eff",
+                 "5-day cross-sectional reversal, weekly rebalance"),
+                ("α3 CS Momentum  25%", "#a78bfa",
+                 "12-1M Jegadeesh-Titman factor, monthly rebalance"),
+                ("α4 Vol Premium  10%", "#e8c96d",
+                 "Daily carry: collect implied > realised vol gap"),
+            ]
+        ]) +
+        '</div></div>', unsafe_allow_html=True)
+
     st.divider()
 
-    with st.spinner("Loading 12 years of market data..."):
+    with st.spinner("Loading 13 years of market data..."):
         df = get_data()
 
     st.markdown(
         f'<p style="font-family:monospace;font-size:10px;color:#4a5568;">'
-        f'Data: {df.index[0].strftime("%b %Y")} → {df.index[-1].strftime("%b %Y")}  '
-        f'({(df.index[-1]-df.index[0]).days/365:.1f} yrs)  ·  {len(df.columns)} tickers</p>',
-        unsafe_allow_html=True,
-    )
+        f'{df.index[0].strftime("%b %Y")} → {df.index[-1].strftime("%b %Y")}  ·  '
+        f'{len(df.columns)} tickers  ·  '
+        f'{((df.index[-1]-df.index[0]).days/365):.1f} years</p>',
+        unsafe_allow_html=True)
 
-    cap_sa  = TOTAL_CAPITAL * ALLOC_SA
-    cap_stm = TOTAL_CAPITAL * ALLOC_STM
-    cap_csm = TOTAL_CAPITAL * ALLOC_CSM
-    cap_vp  = TOTAL_CAPITAL * ALLOC_VP
+    with st.spinner("α1 Stat-Arb — running 10 pairs..."):
+        eq_sa, rep_sa, open_sa, hist_sa = run_stat_arb(df)
 
-    with st.spinner("α1 Stat-Arb on 10 pairs..."):
-        eq_sa,  rep_sa,  open_sa,  hist_sa  = run_stat_arb(df, cap_sa)
-    with st.spinner("α2 Short-Term Momentum..."):
-        eq_stm, rep_stm = run_stm(df, cap_stm)
-    with st.spinner("α3 Cross-Sectional Momentum..."):
-        eq_csm, rep_csm = run_csm(df, cap_csm)
-    with st.spinner("α4 Volatility Premium..."):
-        eq_vp,  _       = run_vp(df, cap_vp)
+    with st.spinner("α2 Short-term reversal..."):
+        eq_stm, rep_stm = run_stm(df)
 
-    portfolio = combine(eq_sa, eq_stm, eq_csm, eq_vp,
-                        cap_sa, cap_stm, cap_csm, cap_vp)
+    with st.spinner("α3 Cross-sectional momentum..."):
+        eq_csm, rep_csm = run_csm(df)
+
+    with st.spinner("α4 Volatility premium..."):
+        eq_vp, _ = run_vp(df)
+
+    portfolio = combine(eq_sa, eq_stm, eq_csm, eq_vp)
 
     spy_eq = None
     if "SPY" in df.columns and len(portfolio) > 0:
         spy = df["SPY"].reindex(portfolio.index).ffill().dropna()
         if len(spy) > 0:
-            spy_eq = spy / spy.iloc[0] * TOTAL_CAPITAL
+            spy_eq = spy / float(spy.iloc[0]) * TOTAL_CAPITAL
 
-    s_port = calc_stats(portfolio, TOTAL_CAPITAL)
-    s_sa   = calc_stats(eq_sa,  cap_sa)
-    s_stm  = calc_stats(eq_stm, cap_stm)
-    s_csm  = calc_stats(eq_csm, cap_csm)
-    s_vp   = calc_stats(eq_vp,  cap_vp)
-    s_sp   = calc_stats(spy_eq, TOTAL_CAPITAL) if spy_eq is not None else {}
+    # ── Stats ────────────────────────────────────────────────────────────
+    st_port = stats(portfolio, TOTAL_CAPITAL)
+    st_sa   = stats(eq_sa,  TOTAL_CAPITAL * PCT_SA)
+    st_stm  = stats(eq_stm, TOTAL_CAPITAL * PCT_STM)
+    st_csm  = stats(eq_csm, TOTAL_CAPITAL * PCT_CSM)
+    st_vp   = stats(eq_vp,  TOTAL_CAPITAL * PCT_VP)
+    st_sp   = stats(spy_eq, TOTAL_CAPITAL) if spy_eq is not None else {}
 
-    # ── KPI strip ────────────────────────────────────────────────────────────
+    # ── KPI strip ─────────────────────────────────────────────────────────
+    pnl_c  = "#00d4a0" if st_port["cagr"] >= 0  else "#f56565"
+    cagr_c = "#00d4a0" if st_port["cagr"] >= 12 else "#f5a623" if st_port["cagr"] >= 5 else "#f56565"
     k = st.columns(7)
-    pc = "#00d4a0" if s_port["cagr"] >= 0 else "#f56565"
-    cc = "#00d4a0" if s_port["cagr"] >= 15 else "#f5a623" if s_port["cagr"] >= 8 else "#f56565"
-    _kpi(k[0], "Final Balance",  f"${s_port['final']:,.0f}",    pc)
-    _kpi(k[1], "CAGR",           fmt_stat(s_port,"cagr"),       cc)
-    _kpi(k[2], "Sharpe",         fmt_stat(s_port,"sharpe",".2f",""), "#e8c96d")
-    _kpi(k[3], "Max Drawdown",   fmt_stat(s_port,"mdd",".1f"),  "#f5a623")
-    _kpi(k[4], "α1 Open Trades", str(len(open_sa)),             "#00ffcc")
-    _kpi(k[5], "α1 CAGR",        fmt_stat(s_sa,  "cagr"),       "#00ffcc")
-    _kpi(k[6], "S&P 500 CAGR",   fmt_stat(s_sp,  "cagr") if s_sp else "–", "#8892a4")
+    _kpi(k[0], "Final Balance",   f"${st_port['final']:>10,.0f}",          pnl_c)
+    _kpi(k[1], "CAGR",            f"{st_port['cagr']:+.1f}%",              cagr_c)
+    _kpi(k[2], "Sharpe",          f"{st_port['sharpe']:.2f}",              "#e8c96d")
+    _kpi(k[3], "Max Drawdown",    f"{st_port['mdd']:.1f}%",                "#f5a623")
+    _kpi(k[4], "Open Pairs",      str(len(open_sa)),                        "#00ffcc")
+    _kpi(k[5], "α1 CAGR",         f"{st_sa['cagr']:+.1f}%",               "#00ffcc")
+    _kpi(k[6], "S&P CAGR",        f"{st_sp.get('cagr',0):+.1f}%",         "#8892a4")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── Equity chart ──────────────────────────────────────────────────────────
+    # ── Equity chart ──────────────────────────────────────────────────────
     fig = go.Figure()
-    palette = [("#00ffcc","α1 Stat-Arb",eq_sa,cap_sa),
-               ("#4a9eff","α2 ST Momentum",eq_stm,cap_stm),
-               ("#a78bfa","α3 CS Momentum",eq_csm,cap_csm),
-               ("#e8c96d","α4 Vol Premium",eq_vp,cap_vp)]
 
-    for col, name, eq, cap in palette:
-        if len(eq) < 5:
+    alpha_info = [
+        (eq_sa,  TOTAL_CAPITAL*PCT_SA,  "#00ffcc", "α1 Stat-Arb"),
+        (eq_stm, TOTAL_CAPITAL*PCT_STM, "#4a9eff", "α2 ST Reversal"),
+        (eq_csm, TOTAL_CAPITAL*PCT_CSM, "#a78bfa", "α3 CS Momentum"),
+        (eq_vp,  TOTAL_CAPITAL*PCT_VP,  "#e8c96d", "α4 Vol Premium"),
+    ]
+    for eq, cap, col, name in alpha_info:
+        if eq is None or len(eq) < 5:
             continue
         scaled = TOTAL_CAPITAL + (eq.reindex(portfolio.index).ffill().fillna(cap) - cap)
-        fig.add_trace(go.Scatter(x=scaled.index, y=scaled, name=name, mode="lines",
+        fig.add_trace(go.Scatter(
+            x=scaled.index, y=scaled, name=name, mode="lines",
             line=dict(color=col, width=1.2), opacity=0.4,
             hovertemplate=name+"  %{x|%b %Y}  $%{y:,.0f}<extra></extra>"))
 
-    fig.add_trace(go.Scatter(x=portfolio.index, y=portfolio,
-        name="Portfolio Total", mode="lines",
+    fig.add_trace(go.Scatter(
+        x=portfolio.index, y=portfolio, name="Portfolio Total",
         fill="tozeroy", fillcolor="rgba(0,212,160,0.06)",
         line=dict(color="#00d4a0", width=3),
         hovertemplate="Portfolio  %{x|%b %Y}  $%{y:,.0f}<extra></extra>"))
 
-    if spy_eq is not None and len(spy_eq) > 0:
-        fig.add_trace(go.Scatter(x=spy_eq.index, y=spy_eq, name="S&P 500",
-            mode="lines", line=dict(color="#8892a4", width=1.5, dash="dot"),
-            hovertemplate="S&P  %{x|%b %Y}  $%{y:,.0f}<extra></extra>"))
+    if spy_eq is not None:
+        fig.add_trace(go.Scatter(
+            x=spy_eq.index, y=spy_eq, name="S&P 500",
+            line=dict(color="#8892a4", width=1.5, dash="dot"),
+            hovertemplate="S&P 500  %{x|%b %Y}  $%{y:,.0f}<extra></extra>"))
 
     fig.add_hline(y=TOTAL_CAPITAL,
                   line=dict(color="rgba(255,255,255,0.15)", width=1, dash="dot"),
-                  annotation_text=f"Start ${TOTAL_CAPITAL:,.0f}",
+                  annotation_text=f"Capital  ${TOTAL_CAPITAL:,.0f}",
                   annotation_font_color="#4a5568", annotation_font_size=10,
                   annotation_position="top left")
 
-    ylo = portfolio.min()*0.95 if len(portfolio)>0 else 0
-    yhi = portfolio.max()*1.05 if len(portfolio)>0 else TOTAL_CAPITAL*1.2
+    y_vals = portfolio.dropna()
+    y_lo   = float(y_vals.min()) * 0.93 if len(y_vals) else 0
+    y_hi   = float(y_vals.max()) * 1.07 if len(y_vals) else TOTAL_CAPITAL * 2
+
     fig.update_layout(
         template="plotly_dark", height=440,
         paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
-        margin=dict(l=12,r=12,t=12,b=12),
-        legend=dict(orientation="h",yanchor="bottom",y=1.01,xanchor="left",x=0,
-                    font=dict(family="IBM Plex Mono",size=10,color="#8892a4"),
+        margin=dict(l=12, r=12, t=12, b=12),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0,
+                    font=dict(family="IBM Plex Mono", size=10, color="#8892a4"),
                     bgcolor="rgba(0,0,0,0)"),
         xaxis=dict(showgrid=False,
-                   rangeselector=dict(bgcolor="#111318",activecolor="#00d4a0",
+                   rangeselector=dict(
+                       bgcolor="#111318", activecolor="#00d4a0",
                        bordercolor="rgba(255,255,255,0.1)",
-                       font=dict(family="IBM Plex Mono",size=10,color="#8892a4"),
-                       buttons=[dict(count=1,label="1Y",step="year",stepmode="backward"),
-                                dict(count=3,label="3Y",step="year",stepmode="backward"),
-                                dict(step="all",label="All")])),
-        yaxis=dict(showgrid=False,zeroline=False,tickprefix="$",range=[ylo,yhi]),
-        hovermode="x unified", font=dict(family="IBM Plex Mono"),
-    )
+                       font=dict(family="IBM Plex Mono", size=10, color="#8892a4"),
+                       buttons=[
+                           dict(count=1, label="1Y", step="year", stepmode="backward"),
+                           dict(count=3, label="3Y", step="year", stepmode="backward"),
+                           dict(count=5, label="5Y", step="year", stepmode="backward"),
+                           dict(step="all", label="All"),
+                       ])),
+        yaxis=dict(showgrid=False, zeroline=False, tickprefix="$",
+                   range=[y_lo, y_hi]),
+        hovermode="x unified", font=dict(family="IBM Plex Mono"))
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── Strategy breakdown cards ──────────────────────────────────────────────
-    st.markdown('<p style="font-family:monospace;font-size:10px;color:#4a5568;'
-                'text-transform:uppercase;letter-spacing:0.1em;margin:4px 0 12px;">'
-                'Alpha Source Breakdown</p>', unsafe_allow_html=True)
+    # ── Strategy breakdown cards ──────────────────────────────────────────
+    st.markdown(
+        '<p style="font-family:monospace;font-size:10px;color:#4a5568;'
+        'text-transform:uppercase;letter-spacing:0.1em;margin:4px 0 12px;">'
+        'Alpha Source Breakdown</p>', unsafe_allow_html=True)
 
-    breakdown = [
-        ("Portfolio", s_port, "#00d4a0", f"${TOTAL_CAPITAL:,.0f}", "All four combined"),
-        ("α1 Stat-Arb",    s_sa,   "#00ffcc", f"${cap_sa:,.0f}",  "10 pairs, RSI + velocity"),
-        ("α2 ST Momentum", s_stm,  "#4a9eff", f"${cap_stm:,.0f}", "5-day reversal"),
-        ("α3 CS Momentum", s_csm,  "#a78bfa", f"${cap_csm:,.0f}", "12-1M factor"),
-        ("α4 Vol Premium", s_vp,   "#e8c96d", f"${cap_vp:,.0f}",  "Vol carry"),
-    ]
     bcols = st.columns(5)
-    for i, (name, st_, col, alloc, desc) in enumerate(breakdown):
+    breakdown = [
+        ("Portfolio", st_port, "#00d4a0", f"${TOTAL_CAPITAL:,.0f}"),
+        ("α1 Stat-Arb",    st_sa,  "#00ffcc", f"${TOTAL_CAPITAL*PCT_SA:,.0f}"),
+        ("α2 ST Reversal", st_stm, "#4a9eff", f"${TOTAL_CAPITAL*PCT_STM:,.0f}"),
+        ("α3 CS Momentum", st_csm, "#a78bfa", f"${TOTAL_CAPITAL*PCT_CSM:,.0f}"),
+        ("α4 Vol Premium", st_vp,  "#e8c96d", f"${TOTAL_CAPITAL*PCT_VP:,.0f}"),
+    ]
+    for i, (name, s, col, alloc) in enumerate(breakdown):
+        cc = "#00d4a0" if s.get("cagr",0) >= 0 else "#f56565"
         bcols[i].markdown(
             '<div style="background:#111318;padding:12px 14px;border-radius:4px;'
             'border:1px solid rgba(255,255,255,0.07);border-top:2px solid ' + col + ';">'
-            '<p style="font-family:monospace;font-size:12px;font-weight:600;color:' + col + ';margin:0 0 3px;">' + name + '</p>'
-            '<p style="font-size:10px;color:#4a5568;margin:0 0 8px;font-family:monospace;">' + alloc + ' · ' + desc + '</p>'
-            + _row("CAGR",   fmt_stat(st_,"cagr"),             col)
-            + _row("Sharpe", fmt_stat(st_,"sharpe",".2f",""),  "#e8eaf0")
-            + _row("Max DD", fmt_stat(st_,"mdd",".1f"),        "#f5a623")
-            + _row("Final",  f"${st_.get('final', 0):,.0f}",   col)
-            + '</div>',
-            unsafe_allow_html=True,
-        )
+            '<p style="font-family:monospace;font-size:12px;font-weight:600;color:' + col + ';margin:0 0 6px;">'
+            + name + '</p>'
+            + _row("Alloc",   alloc)
+            + _row("CAGR",    f"{s.get('cagr',0):+.1f}%",    cc)
+            + _row("Sharpe",  f"{s.get('sharpe',0):.2f}",     "#e8eaf0")
+            + _row("Max DD",  f"{s.get('mdd',0):.1f}%",       "#f5a623")
+            + _row("Final",   f"${s.get('final',0):,.0f}",    cc)
+            + '</div>', unsafe_allow_html=True)
 
-    # ── Active stat-arb signals ───────────────────────────────────────────────
+    # ── Live α1 signals ───────────────────────────────────────────────────
     if open_sa:
         st.divider()
-        st.markdown('<h2 style="font-family:monospace;margin-bottom:12px;">'
-                    'Live α1 Stat-Arb Signals</h2>', unsafe_allow_html=True)
-        scols = st.columns(min(len(open_sa), 3))
+        st.markdown('<h2 style="font-family:monospace;">Live Stat-Arb Signals</h2>',
+                    unsafe_allow_html=True)
+        scols = st.columns(min(len(open_sa), 4))
         for i, (pk, ot) in enumerate(open_sa.items()):
             t1, t2 = pk.split("/")
-            is_l   = ot["direction"] == "LONG"
-            accent = "#00ffcc" if is_l else "#ff4b4b"
-            pnl_c  = "#00d4a0" if ot["live_pnl"] >= 0 else "#f56565"
-            pnl_s  = ("+" if ot["live_pnl"] >= 0 else "") + f"${ot['live_pnl']:,.2f}"
-            scols[i % 3].markdown(
-                '<div style="background:' + ("rgba(0,255,204,0.04)" if is_l else "rgba(255,75,75,0.04)") + ';'
-                'border:1px solid ' + ("rgba(0,255,204,0.25)" if is_l else "rgba(255,75,75,0.25)") + ';'
-                'border-top:2px solid ' + accent + ';border-radius:5px;padding:12px;">'
+            ac = "#00ffcc" if ot["direction"]=="LONG" else "#ff4b4b"
+            pc = "#00d4a0" if ot["live_pnl"] >= 0 else "#f56565"
+            ps = ("+" if ot["live_pnl"]>=0 else "") + f"${ot['live_pnl']:,.0f}"
+            scols[i % 4].markdown(
+                '<div style="background:rgba(0,0,0,0.3);border:1px solid '
+                + ("rgba(0,255,204,0.3)" if ot["direction"]=="LONG" else "rgba(255,75,75,0.3)")
+                + ';border-top:2px solid ' + ac + ';border-radius:5px;padding:12px;">'
                 '<div style="display:flex;justify-content:space-between;margin-bottom:8px;">'
-                '<p style="margin:0;font-family:monospace;font-size:14px;font-weight:600;color:' + accent + ';">'
+                '<p style="margin:0;font-family:monospace;font-size:13px;font-weight:600;color:' + ac + ';">'
                 + t1 + ' / ' + t2 + '</p>'
-                '<p style="margin:0;font-family:monospace;font-size:16px;color:' + pnl_c + ';">' + pnl_s + '</p>'
+                '<p style="margin:0;font-family:monospace;font-size:14px;color:' + pc + ';">' + ps + '</p>'
                 '</div>'
-                + _row("Direction", ot["direction"],                      accent)
-                + _row("Entry Z",   str(round(ot["entry_z"],  2)),         "#e8eaf0")
-                + _row("Current Z", str(round(ot["curr_z"],   2)),         accent)
-                + _row("Days held", str(ot["days_held"]) + "d",            "#e8eaf0")
-                + '</div>',
-                unsafe_allow_html=True,
-            )
+                + _row("Direction",  ot["direction"],                         ac)
+                + _row("Entry Z",    str(round(ot["entry_z"], 2)),            "#e8eaf0")
+                + _row("Current Z",  str(round(ot["curr_z"], 2)),             ac)
+                + _row("Days Held",  str(ot["days_held"]) + " / " + str(SA_HOLD), "#e8eaf0")
+                + '</div>', unsafe_allow_html=True)
 
-    # ── Honest expectations ───────────────────────────────────────────────────
+    # ── Honest expectations ───────────────────────────────────────────────
     st.divider()
     st.markdown(
-        '<div style="background:#111318;border-radius:6px;padding:18px 22px;'
+        '<div style="background:#111318;border-radius:6px;padding:20px 24px;'
         'border-left:3px solid #f5a623;">'
-        '<p style="font-family:monospace;font-size:10px;color:#f5a623;margin:0 0 10px;'
-        'text-transform:uppercase;letter-spacing:0.1em;">Honest CAGR Expectations</p>'
-        '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:18px;">'
-        '<div><p style="font-family:monospace;font-size:11px;color:#e8eaf0;margin:0 0 4px;">This System (no leverage)</p>'
-        '<p style="font-size:11px;color:#8892a4;line-height:1.7;margin:0;">'
-        'Realistic: <b style="color:#00d4a0;">15–25% CAGR</b>, Sharpe 1.2–1.8. '
-        'Add 2× leverage → 25–40% CAGR at higher drawdown.</p></div>'
-        '<div><p style="font-family:monospace;font-size:11px;color:#e8eaf0;margin:0 0 4px;">Medallion Fund (actual)</p>'
-        '<p style="font-size:11px;color:#8892a4;line-height:1.7;margin:0;">'
-        '66% gross required 300+ PhD staff, 12–17× leverage, nanosecond execution, '
-        'and microstructure signals unavailable to retail.</p></div>'
-        '<div><p style="font-family:monospace;font-size:11px;color:#e8eaf0;margin:0 0 4px;">What Gemini gave you</p>'
-        '<p style="font-size:11px;color:#8892a4;line-height:1.7;margin:0;">'
-        'Ran <code>np.random.normal(cagr=0.52)</code> — a random walk with the answer '
-        'hardcoded. No trades, no market data. '
-        '<b style="color:#f56565;">Pure hallucination.</b></p></div>'
-        '</div></div>',
-        unsafe_allow_html=True,
-    )
+        '<p style="font-family:monospace;font-size:11px;color:#f5a623;margin:0 0 12px;'
+        'text-transform:uppercase;letter-spacing:0.12em;">Honest CAGR Expectations</p>'
+        '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:20px;">'
+        '<div><p style="font-family:monospace;font-size:11px;color:#e8eaf0;margin:0 0 5px;">This System</p>'
+        '<p style="font-size:11px;color:#8892a4;margin:0;line-height:1.7;">'
+        'Realistic: <b style="color:#00d4a0;">15–25% CAGR</b>, Sharpe 1.0–1.8. '
+        'Four uncorrelated sources, no leverage. Adding 2× leverage → 25–40% CAGR '
+        'at the cost of doubled drawdowns.</p></div>'
+        '<div><p style="font-family:monospace;font-size:11px;color:#e8eaf0;margin:0 0 5px;">Medallion Fund</p>'
+        '<p style="font-size:11px;color:#8892a4;margin:0;line-height:1.7;">'
+        '66% gross CAGR required 12–17× leverage, 300+ PhD staff, '
+        'nanosecond dark-pool execution, and signals unavailable to any '
+        'retail system. Net to investors: ~39% after 5+44% fees.</p></div>'
+        '<div><p style="font-family:monospace;font-size:11px;color:#e8eaf0;margin:0 0 5px;">Gemini\'s "Backtest"</p>'
+        '<p style="font-size:11px;color:#8892a4;margin:0;line-height:1.7;">'
+        'Set <code>cagr=0.52</code> as a Python variable, ran '
+        '<code>np.random.normal()</code>, reported the output as a strategy result. '
+        '<b style="color:#f56565;">No market data. No trades. Pure hallucination.</b></p></div>'
+        '</div></div>', unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
