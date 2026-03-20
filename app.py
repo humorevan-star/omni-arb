@@ -56,12 +56,43 @@ def compute_legs(sig, capital=STARTING_CAPITAL):
     target_per_leg = capital / 2
     shares_a = max(1, int(target_per_leg / sig["price_a"]))
     shares_b = max(1, int(shares_a * sig["beta"]))
+
+    # Unrealised P&L from open_trade entry prices (if available)
+    pnl        = None
+    pnl_a      = None
+    pnl_b      = None
+    entry_pa   = None
+    entry_pb   = None
+    ot = sig.get("open_trade")
+    if ot and ot.get("entry_price_a") and ot.get("entry_price_b"):
+        ep_a     = float(ot["entry_price_a"])
+        ep_b     = float(ot["entry_price_b"])
+        cp_a     = float(sig["price_a"])
+        cp_b     = float(sig["price_b"])
+        entry_pa = round(ep_a, 2)
+        entry_pb = round(ep_b, 2)
+        is_long  = ot["direction"] == "LONG"
+        # Long: bought A, sold B. P&L = (curr_a - entry_a)*shares_a - (curr_b - entry_b)*shares_b
+        # Short: sold A, bought B. P&L = (entry_a - curr_a)*shares_a - (entry_b - curr_b)*shares_b
+        if is_long:
+            pnl_a = round((cp_a - ep_a) * shares_a, 2)
+            pnl_b = round(-(cp_b - ep_b) * shares_b, 2)
+        else:
+            pnl_a = round(-(cp_a - ep_a) * shares_a, 2)
+            pnl_b = round((cp_b - ep_b) * shares_b, 2)
+        pnl = round(pnl_a + pnl_b, 2)
+
     return {
         "shares_a":   shares_a,
         "shares_b":   shares_b,
         "notional_a": round(shares_a * sig["price_a"], 2),
         "notional_b": round(shares_b * sig["price_b"], 2),
         "total_cost": round((shares_a * sig["price_a"]) + (shares_b * sig["price_b"]), 2),
+        "pnl":        pnl,
+        "pnl_a":      pnl_a,
+        "pnl_b":      pnl_b,
+        "entry_pa":   entry_pa,
+        "entry_pb":   entry_pb,
     }
 
 
@@ -98,10 +129,12 @@ def process_pairs(df_raw):
         curr_z   = z_series.iloc[-1]
         adf_pval = adfuller(spread)[1]
 
-        in_open        = False
-        open_direction = None
-        open_entry_z   = None
-        open_entry_date= None
+        in_open          = False
+        open_direction   = None
+        open_entry_z     = None
+        open_entry_date  = None
+        open_entry_pa    = None   # price of leg A at entry
+        open_entry_pb    = None   # price of leg B at entry
 
         for _i in range(1, len(z_series)):
             _zp = z_series.iloc[_i - 1]
@@ -110,15 +143,19 @@ def process_pairs(df_raw):
 
             if not in_open:
                 if _zp > -ENTRY_Z and _zc <= -ENTRY_Z:
-                    in_open = True
-                    open_direction  = "LONG"
-                    open_entry_z    = _zc
-                    open_entry_date = _dt
+                    in_open          = True
+                    open_direction   = "LONG"
+                    open_entry_z     = _zc
+                    open_entry_date  = _dt
+                    open_entry_pa    = pair_df[ticker_a].loc[_dt] if _dt in pair_df.index else None
+                    open_entry_pb    = pair_df[ticker_b].loc[_dt] if _dt in pair_df.index else None
                 elif _zp < ENTRY_Z and _zc >= ENTRY_Z:
-                    in_open = True
-                    open_direction  = "SHORT"
-                    open_entry_z    = _zc
-                    open_entry_date = _dt
+                    in_open          = True
+                    open_direction   = "SHORT"
+                    open_entry_z     = _zc
+                    open_entry_date  = _dt
+                    open_entry_pa    = pair_df[ticker_a].loc[_dt] if _dt in pair_df.index else None
+                    open_entry_pb    = pair_df[ticker_b].loc[_dt] if _dt in pair_df.index else None
             else:
                 closed = (
                     (open_direction == "LONG"  and _zp < 0 and _zc >= 0) or
@@ -126,10 +163,12 @@ def process_pairs(df_raw):
                     abs(_zc) >= STOP_Z
                 )
                 if closed:
-                    in_open        = False
-                    open_direction = None
-                    open_entry_z   = None
-                    open_entry_date= None
+                    in_open          = False
+                    open_direction   = None
+                    open_entry_z     = None
+                    open_entry_date  = None
+                    open_entry_pa    = None
+                    open_entry_pb    = None
 
         pct_to_target = 0.0
         if in_open and open_entry_z and open_entry_z != 0:
@@ -144,6 +183,8 @@ def process_pairs(df_raw):
                 "entry_date":   open_entry_date,
                 "curr_z":       curr_z,
                 "pct_to_target": pct_to_target,
+                "entry_price_a": open_entry_pa,
+                "entry_price_b": open_entry_pb,
             }
             if in_open else None
         )
@@ -212,6 +253,41 @@ def render_trade_card(sig):
     not_a_str   = "$" + "{:,.0f}".format(legs["notional_a"])
     not_b_str   = "$" + "{:,.0f}".format(legs["notional_b"])
     total_str   = "$" + "{:,.0f}".format(legs["total_cost"])
+
+    # Entry prices & P&L strings
+    epa_str     = "$" + str(round(legs["entry_pa"], 2)) if legs["entry_pa"] else None
+    epb_str     = "$" + str(round(legs["entry_pb"], 2)) if legs["entry_pb"] else None
+    pnl_val     = legs["pnl"]
+    pnl_a_val   = legs["pnl_a"]
+    pnl_b_val   = legs["pnl_b"]
+    has_pnl     = pnl_val is not None
+
+    def fmt_pnl(v):
+        if v is None: return ""
+        sign = "+" if v >= 0 else ""
+        col  = "#00d4a0" if v >= 0 else "#f56565"
+        return '<span style="color:' + col + ';font-family:monospace;font-size:11px;font-weight:600;">' + sign + "${:,.0f}".format(v) + "</span>"
+
+    pnl_badge = ""
+    if has_pnl:
+        pnl_sign  = "+" if pnl_val >= 0 else ""
+        pnl_color = "#00d4a0" if pnl_val >= 0 else "#f56565"
+        pnl_bg    = "rgba(0,212,160,0.10)" if pnl_val >= 0 else "rgba(245,101,101,0.10)"
+        pnl_border= "rgba(0,212,160,0.30)" if pnl_val >= 0 else "rgba(245,101,101,0.30)"
+        pnl_label = "UNREALISED P&L"
+        pnl_badge = (
+            '<div style="display:inline-flex;align-items:center;gap:10px;'
+            'background:' + pnl_bg + ';border:1px solid ' + pnl_border + ';'
+            'border-radius:4px;padding:6px 14px;margin-bottom:14px;">'
+            '<span style="font-size:9px;color:#4a5568;font-family:monospace;'
+            'text-transform:uppercase;letter-spacing:0.1em;">' + pnl_label + '</span>'
+            '<span style="font-family:monospace;font-size:20px;font-weight:600;color:' + pnl_color + ';">'
+            + pnl_sign + "${:,.0f}".format(pnl_val) + '</span>'
+            '<span style="font-size:10px;color:#4a5568;font-family:monospace;">'
+            'Leg A: ' + fmt_pnl(pnl_a_val) + '  Leg B: ' + fmt_pnl(pnl_b_val)
+            + '</span>'
+            '</div>'
+        )
     dir_label   = ("LONG  — Buy the Spread" if is_long else "SHORT  — Sell the Spread")
     opt_type    = "Bull Call Spread" if is_long else "Bear Put Spread"
     opt_action  = "Buy Call + Sell Call (higher strike)" if is_long else "Buy Put + Sell Put (lower strike)"
@@ -256,14 +332,24 @@ def render_trade_card(sig):
         + progress_bar +
         '</div>'
 
-        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">'
+        + pnl_badge
+        + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">'
 
         '<div style="background:rgba(0,0,0,0.25);border-radius:4px;padding:12px 14px;'
         'border:1px solid rgba(255,255,255,0.05);">'
         '<p style="margin:0 0 8px;font-size:10px;color:#4a9eff;font-family:monospace;'
         'text-transform:uppercase;letter-spacing:0.1em;">Option 1 — Stock Execution</p>'
-        + _row(leg1_action + "  " + sig["a"], sha_str + " shs @ " + pa_str + "  =  " + not_a_str, leg1_col)
-        + _row(leg2_action + "  " + sig["b"], shb_str + " shs @ " + pb_str + "  =  " + not_b_str, leg2_col)
+        + (pnl_badge if has_pnl else '')
+        + _row(leg1_action + "  " + sig["a"],
+               sha_str + " shs"
+               + ("  entry " + epa_str + "  →  now " + pa_str if epa_str else "  @ " + pa_str)
+               + "  =  " + not_a_str,
+               leg1_col)
+        + _row(leg2_action + "  " + sig["b"],
+               shb_str + " shs"
+               + ("  entry " + epb_str + "  →  now " + pb_str if epb_str else "  @ " + pb_str)
+               + "  =  " + not_b_str,
+               leg2_col)
         + _row("Total Capital Used", total_str, "#e8eaf0")
         + '</div>'
 
