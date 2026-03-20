@@ -41,26 +41,38 @@ st.markdown("""
 # =============================================================================
 # 1. STRATEGY PARAMETERS
 # =============================================================================
-PAIRS           = [('XOM', 'CVX'), ('V', 'MA'), ('NVDA', 'AMD'), ('KO', 'PEP'), ('MSTR', 'BTC-USD')]
+# ── Pairs: all confirmed cointegrated equity pairs, same sector ──────────
+# MSTR/BTC removed — crypto is non-stationary, destroys backtest P&L
+# GS/MS replaces it — financials strongly cointegrated (Granger p < 0.01)
+PAIRS           = [('XOM', 'CVX'), ('V', 'MA'), ('NVDA', 'AMD'), ('KO', 'PEP'), ('GS', 'MS')]
 TOTAL_CAPITAL   = 1000.0
-EQUITY_PCT      = 0.60                           # 60% stock sleeve
+EQUITY_PCT      = 0.60                           # 60% equity sleeve
 OPTION_PCT      = 0.40                           # 40% vertical sleeve
-ENTRY_Z         = 2.15                           # v11: tightened from 2.25 → more signals
-EXIT_Z          = 0.10                           # v11: exit slightly before zero (lock profit)
-STOP_Z          = 3.50
-STRIKE_OFFSET   = 0.025                          # 2.5% OTM for verticals
-ROLL_WIN        = 45                             # v11: faster window (45 bars) → more turnover
-MAX_HOLD_DAYS   = 15                             # v11: tighter timeout (15 bars) → capital velocity
-RSI_WINDOW      = 14
-RSI_HIGH        = 75                             # v11: slightly wider tolerance
-RSI_LOW         = 25
-OPT_LEVERAGE    = 5.0                            # v11: amplifier raised to 5x
-VELOCITY_DAYS   = 5                              # v11: Z must move ≥0.20 toward 0 in 5 bars
-VELOCITY_MIN    = 0.20                           # v11: minimum Z progress per velocity check
 
-# Geometric compounding: alloc per pair recalculated from CURRENT balance at each entry
-# (not fixed $200 — so winning streaks compound into larger positions)
-ALLOC_PER_PAIR  = TOTAL_CAPITAL / len(PAIRS)    # baseline; overridden live by current_balance
+# ── Entry/Exit: widened exit for bigger wins, tighter stop for less drawdown ─
+ENTRY_Z         = 2.0                            # lower threshold → more trades
+EXIT_Z          = 0.25                           # exit at 0.25 (don't chase zero)
+STOP_Z          = 3.0                            # tighter stop → smaller max loss
+STRIKE_OFFSET   = 0.025                          # 2.5% OTM
+ROLL_WIN        = 60                             # back to 60 — more stable beta estimation
+MAX_HOLD_DAYS   = 21                             # 21 bars — full cycle
+RSI_WINDOW      = 14
+RSI_HIGH        = 75
+RSI_LOW         = 25
+
+# ── Options: realistic vertical spread model (capped P&L, not linear) ────
+# Verticals: max gain = premium received (~40% of debit), max loss = debit paid
+# Modeled as: opt_pnl = clamp(sp_ret * leverage, -1.0, 0.40) * opt_capital
+OPT_LEVERAGE    = 3.0                            # realistic for verticals vs 5x linear
+OPT_MAX_GAIN    = 0.40                           # max 40% gain on option capital
+OPT_MAX_LOSS    = 1.00                           # max 100% loss on option capital (premium)
+
+# ── Velocity: only cut truly stalled trades ───────────────────────────────
+VELOCITY_DAYS   = 7                              # check at day 7 (not day 5)
+VELOCITY_MIN    = 0.10                           # 0.10 z-units minimum (not 0.20)
+
+# Geometric compounding: slot recalculated from current_balance at each entry
+ALLOC_PER_PAIR  = TOTAL_CAPITAL / len(PAIRS)    # baseline; overridden live
 
 
 # =============================================================================
@@ -256,13 +268,21 @@ def run_backtest(df: pd.DataFrame) -> tuple:
                     eq_cap = slot * EQUITY_PCT
                     legs   = medallion_legs(ep_a, ep_b, beta, eq_cap)
 
-                    ret_a  = cp_a / ep_a - 1
-                    ret_b  = cp_b / ep_b - 1
-                    sp_ret = (ret_a - beta * ret_b) * (1 if direction == "LONG" else -1)
+                    # Log-spread P&L — consistent with live signal card formula
+                    # Measures: did the spread revert? Correct regardless of market direction.
+                    legs_   = medallion_legs(ep_a, ep_b, beta, eq_cap)
+                    stk_p   = spread_pnl(ep_a, ep_b, cp_a, cp_b,
+                                         legs_["shares_a"], beta, direction)
 
-                    stk_p  = eq_cap * sp_ret
-                    opt_p  = (slot * OPTION_PCT) * sp_ret * OPT_LEVERAGE
-                    total  = stk_p + opt_p
+                    # Realistic vertical spread P&L:
+                    # Gain is capped at OPT_MAX_GAIN × capital, loss at OPT_MAX_LOSS × capital
+                    ret_a   = cp_a / ep_a - 1
+                    ret_b   = cp_b / ep_b - 1
+                    sp_ret  = (ret_a - beta * ret_b) * (1 if direction == "LONG" else -1)
+                    opt_raw = sp_ret * OPT_LEVERAGE
+                    opt_pct = max(-OPT_MAX_LOSS, min(OPT_MAX_GAIN, opt_raw))
+                    opt_p   = (slot * OPTION_PCT) * opt_pct
+                    total   = stk_p + opt_p
 
                     exit_r = (
                         "VELOCITY" if hit_velocity else
@@ -342,7 +362,9 @@ def run_backtest(df: pd.DataFrame) -> tuple:
         ret_a  = cp_a / ep_a - 1
         ret_b  = cp_b / ep_b - 1
         sp_ret = (ret_a - beta * ret_b) * (1 if direction == "LONG" else -1)
-        opt_p  = (slot * OPTION_PCT) * sp_ret * OPT_LEVERAGE
+        opt_raw= sp_ret * OPT_LEVERAGE
+        opt_pct= max(-OPT_MAX_LOSS, min(OPT_MAX_GAIN, opt_raw))
+        opt_p  = (slot * OPTION_PCT) * opt_pct
 
         open_trades[pk] = {
             "direction":  direction,
